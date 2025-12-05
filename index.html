@@ -77,10 +77,11 @@
             currentUser: null,
             leads: [],
             users: [],
-            categories: [], // Fetched from business_categories
-            activityTypes: [], // Fetched from activity_types
-            products: [], // Fetched from products
-            demands: [], // Fetched from demands
+            userLookup: {}, // Map ID -> Name
+            categories: [], 
+            activityTypes: [], 
+            products: [], 
+            demands: [], 
             
             // Login
             loginForm: { username: '', password: '' },
@@ -88,7 +89,7 @@
             isLoggingIn: false,
             
             // Manager General
-            managerTab: 'leads', // leads, demands, visitors, products, settings
+            managerTab: 'leads',
             managerFilter: 'all',
 
             // Manager: Visitor CRUD
@@ -107,7 +108,7 @@
             showCategoryModal: false,
             categoryForm: { id: null, name: '' },
 
-            // Visitor App Form (Lead Registration)
+            // Visitor App Form
             form: {
                 city: 'ahvaz',
                 business_name: '',
@@ -122,8 +123,8 @@
             demandForm: {
                 lead_id: null,
                 lead_name: '',
-                lead_category_id: '', // Used to filter products
-                product_id: '', // Changed from name to ID
+                lead_category_id: '', 
+                product_id: '',
                 quantity: ''
             },
 
@@ -186,6 +187,16 @@
             if (!state.currentUser) return;
             updateState({ isLoadingData: true });
             
+            // 0. Fetch Users Map (To resolve IDs to Names)
+            const { data: allUsers } = await supabase.from('users').select('id, name, role, username, region');
+            if (allUsers) {
+                state.users = allUsers.filter(u => u.role === 'visitor'); // Keep list for manager
+                state.userLookup = allUsers.reduce((acc, u) => {
+                    acc[u.id] = u.name;
+                    return acc;
+                }, {});
+            }
+
             // 1. Fetch Categories
             const { data: catData } = await supabase.from('business_categories').select('*').order('name');
             if (catData) state.categories = catData;
@@ -201,9 +212,10 @@
             // 4. Fetch Leads
             let leadsQuery = supabase.from('leads').select('*').order('created_at', { ascending: false });
             
-            // 🔒 SECURITY UPDATE: Filter leads for visitors
+            // 🔒 SECURITY UPDATE: Filter by visitor_id, NOT name. 
+            // This is robust against name changes.
             if (state.currentUser.role === 'visitor') {
-                leadsQuery = leadsQuery.eq('user_name', state.currentUser.name);
+                leadsQuery = leadsQuery.eq('visitor_id', state.currentUser.id);
             }
 
             const { data: leadsData } = await leadsQuery;
@@ -212,12 +224,6 @@
             // 5. Fetch Demands (New)
             const { data: demandsData } = await supabase.from('demands').select('*').order('created_at', { ascending: false });
             state.demands = demandsData || [];
-
-            // 6. Fetch Users (Manager Only)
-            if (state.currentUser.role === 'manager') {
-                const { data: usersData } = await supabase.from('users').select('*').eq('role', 'visitor');
-                state.users = usersData || [];
-            }
             
             updateState({ isLoadingData: false });
         }
@@ -263,7 +269,8 @@
                 phone: state.form.phone,
                 activity_type_id: state.form.activity_type_id || null, 
                 city: state.form.city,
-                user_name: state.currentUser.name,
+                visitor_name: state.currentUser.name, // Legacy/Cache
+                visitor_id: state.currentUser.id, // ✅ ROBUST LINK
                 business_category_id: state.form.business_category_id
             };
 
@@ -297,7 +304,6 @@
 
         function handleDemandInput(key, value) {
             state.demandForm[key] = value;
-            // Force re-render to update units if product changes
             if(key === 'product_id') render();
         }
 
@@ -312,7 +318,8 @@
                 lead_id: lead_id,
                 product_id: product_id,
                 quantity: parseFloat(quantity),
-                visitor_name: state.currentUser.name
+                visitor_name: state.currentUser.name, // Legacy/Cache
+                visitor_id: state.currentUser.id // ✅ ROBUST LINK
             };
 
             const { data, error } = await supabase.from('demands').insert([payload]).select();
@@ -323,7 +330,7 @@
                 console.error('Demand Error:', error);
                 showToast('خطا در ثبت سفارش: ' + error.message, 'error');
             } else {
-                state.demands = [data[0], ...state.demands]; // Update local state
+                state.demands = [data[0], ...state.demands]; 
                 showToast('سفارش با موفقیت ثبت شد', 'success');
                 updateState({ showDemandModal: false });
             }
@@ -429,6 +436,8 @@
                 } else {
                     state.users = [...state.users, data[0]];
                 }
+                // Refresh map if name changed
+                state.userLookup[data[0].id] = data[0].name;
                 updateState({ showVisitorModal: false });
                 showToast(id ? 'ویزیتور ویرایش شد' : 'ویزیتور جدید ایجاد شد', 'success');
             }
@@ -458,7 +467,7 @@
                 showLeadModal: true,
                 leadForm: lead 
                     ? { ...lead } 
-                    : { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type_id: defaultAct, business_category_id: defaultCat, user_name: state.currentUser.name }
+                    : { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type_id: defaultAct, business_category_id: defaultCat, visitor_name: state.currentUser.name }
             });
         }
 
@@ -473,12 +482,16 @@
                 activity_type_id: formData.activity_type_id || null, 
                 city: formData.city,
                 business_category_id: formData.business_category_id, 
-                user_name: formData.user_name || state.currentUser.name
+                // Only set visitor info if it's a new record created by manager (as self) or if explicitly handled
+                visitor_name: formData.visitor_name || state.currentUser.name,
+                visitor_id: formData.visitor_id || state.currentUser.id
             };
 
             let result;
             if (formData.id) {
-                result = await supabase.from('leads').update(payload).eq('id', formData.id).select();
+                // Remove visitor_id from update payload to prevent changing owner accidentally
+                const { visitor_id, ...updatePayload } = payload;
+                result = await supabase.from('leads').update(updatePayload).eq('id', formData.id).select();
             } else {
                 result = await supabase.from('leads').insert([payload]).select();
             }
@@ -603,6 +616,12 @@
         function getLeadName(id) {
             const lead = state.leads.find(l => l.id === id);
             return lead ? lead.business_name : 'نامشخص';
+        }
+
+        // Helper to get Visitor Name by ID (Fallback to stored text)
+        function getVisitorName(id, fallbackName) {
+            if (id && state.userLookup[id]) return state.userLookup[id];
+            return fallbackName || 'ناشناس';
         }
 
         function formatDate(dateStr) {
@@ -813,6 +832,9 @@
                     const cleanLead = JSON.stringify(lead).replace(/"/g, '&quot;');
                     const categoryName = getCategoryName(lead.business_category_id);
                     const activityName = getActivityName(lead.activity_type_id);
+                    // NEW: Use helper to resolve name by ID
+                    const visitorDisplay = getVisitorName(lead.visitor_id, lead.visitor_name);
+
                     return `
                     <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0 group">
                         <td class="px-4 py-3">
@@ -821,7 +843,7 @@
                         </td>
                         <td class="px-4 py-3 text-gray-600 hidden md:table-cell">${lead.contact_name || '-'}</td>
                         <td class="px-4 py-3"><span class="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs">${activityName}</span></td>
-                        <td class="px-4 py-3 text-sm text-gray-500">${lead.user_name || '-'}</td>
+                        <td class="px-4 py-3 text-sm text-gray-500">${visitorDisplay || '-'}</td>
                         <td class="px-4 py-3">
                             <div class="flex gap-2 opacity-100 md:opacity-0 group-hover:opacity-100 transition-opacity">
                                 <button onclick="openLeadModal(${cleanLead})" class="p-1.5 text-blue-600 bg-blue-50 rounded hover:bg-blue-100"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
@@ -852,13 +874,15 @@
                     const productName = getProductName(d.product_id);
                     const unit = getProductUnitLabel(d.product_id);
                     const date = formatDate(d.created_at);
+                    // NEW: Use helper to resolve name by ID
+                    const visitorDisplay = getVisitorName(d.visitor_id, d.visitor_name);
                     
                     return `
                     <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0">
                         <td class="px-4 py-3 font-bold text-gray-800">${leadName}</td>
                         <td class="px-4 py-3 text-gray-700">${productName}</td>
                         <td class="px-4 py-3 font-medium text-blue-700">${d.quantity} <span class="text-xs text-gray-500">${unit}</span></td>
-                        <td class="px-4 py-3 text-sm text-gray-500">${d.visitor_name || '-'}</td>
+                        <td class="px-4 py-3 text-sm text-gray-500">${visitorDisplay || '-'}</td>
                         <td class="px-4 py-3 text-sm text-gray-400 dir-ltr text-right">${date}</td>
                     </tr>`;
                 }).join('');
