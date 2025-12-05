@@ -63,6 +63,14 @@
             { id: 'other', label: 'سایر' }
         ];
 
+        const PRODUCT_UNITS = [
+            { id: 'pcs', label: 'عدد (Pcs)' },
+            { id: 'kg', label: 'کیلوگرم (Kg)' },
+            { id: 'box', label: 'جعبه/کارتن (Box)' },
+            { id: 'liter', label: 'لیتر (Liter)' },
+            { id: 'meter', label: 'متر (Meter)' }
+        ];
+
         // --- STATE ---
         let state = {
             view: 'login', 
@@ -71,6 +79,8 @@
             users: [],
             categories: [], // Fetched from business_categories
             activityTypes: [], // Fetched from activity_types
+            products: [], // Fetched from products
+            demands: [], // Fetched from demands
             
             // Login
             loginForm: { username: '', password: '' },
@@ -78,7 +88,7 @@
             isLoggingIn: false,
             
             // Manager General
-            managerTab: 'leads', // leads, visitors, settings
+            managerTab: 'leads', // leads, demands, visitors, products, settings
             managerFilter: 'all',
 
             // Manager: Visitor CRUD
@@ -89,19 +99,34 @@
             showLeadModal: false,
             leadForm: { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type_id: '', business_category_id: '' },
 
+            // Manager: Product CRUD
+            showProductModal: false,
+            productForm: { id: null, name: '', unit: 'pcs', business_category_id: '', preffered_price: '' },
+
             // Settings (Categories CRUD)
             showCategoryModal: false,
             categoryForm: { id: null, name: '' },
 
-            // Visitor App Form
+            // Visitor App Form (Lead Registration)
             form: {
                 city: 'ahvaz',
                 business_name: '',
                 contact_name: '',
                 phone: '',
-                activity_type_id: '', // Changed to ID
+                activity_type_id: '',
                 business_category_id: '' 
             },
+
+            // Demand Registration
+            showDemandModal: false,
+            demandForm: {
+                lead_id: null,
+                lead_name: '',
+                lead_category_id: '', // Used to filter products
+                product_id: '', // Changed from name to ID
+                quantity: ''
+            },
+
             isSaving: false,
             isLoadingData: false
         };
@@ -165,15 +190,30 @@
             const { data: catData } = await supabase.from('business_categories').select('*').order('name');
             if (catData) state.categories = catData;
 
-            // 2. Fetch Activity Types (Replaces hardcoded SECTORS)
+            // 2. Fetch Activity Types
             const { data: actData } = await supabase.from('activity_types').select('*').order('name');
             if (actData) state.activityTypes = actData;
 
-            // 3. Fetch Leads
-            const { data: leadsData } = await supabase.from('leads').select('*').order('created_at', { ascending: false });
+            // 3. Fetch Products
+            const { data: prodData } = await supabase.from('products').select('*').order('name');
+            if (prodData) state.products = prodData;
+
+            // 4. Fetch Leads
+            let leadsQuery = supabase.from('leads').select('*').order('created_at', { ascending: false });
+            
+            // 🔒 SECURITY UPDATE: Filter leads for visitors
+            if (state.currentUser.role === 'visitor') {
+                leadsQuery = leadsQuery.eq('user_name', state.currentUser.name);
+            }
+
+            const { data: leadsData } = await leadsQuery;
             state.leads = leadsData || [];
 
-            // 4. Fetch Users (Manager Only)
+            // 5. Fetch Demands (New)
+            const { data: demandsData } = await supabase.from('demands').select('*').order('created_at', { ascending: false });
+            state.demands = demandsData || [];
+
+            // 6. Fetch Users (Manager Only)
             if (state.currentUser.role === 'manager') {
                 const { data: usersData } = await supabase.from('users').select('*').eq('role', 'visitor');
                 state.users = usersData || [];
@@ -217,15 +257,14 @@
         async function submitLead() {
             updateState({ isSaving: true });
             
-            // Prepare payload matching new schema
             const newLead = {
                 business_name: state.form.business_name,
                 contact_name: state.form.contact_name,
                 phone: state.form.phone,
-                activity_type_id: state.form.activity_type_id || null, // UUID now
+                activity_type_id: state.form.activity_type_id || null, 
                 city: state.form.city,
                 user_name: state.currentUser.name,
-                business_category_id: state.form.business_category_id // UUID Not Null
+                business_category_id: state.form.business_category_id
             };
 
             const { data, error } = await supabase.from('leads').insert([newLead]).select();
@@ -240,6 +279,113 @@
                 showToast('اطلاعات با موفقیت ذخیره شد', 'success');
             }
         }
+
+        // --- DEMAND REGISTRATION ACTIONS ---
+
+        function openDemandModal(leadId, leadName, leadCategoryId) {
+            updateState({
+                showDemandModal: true,
+                demandForm: {
+                    lead_id: leadId,
+                    lead_name: leadName,
+                    lead_category_id: leadCategoryId,
+                    product_id: '',
+                    quantity: ''
+                }
+            });
+        }
+
+        function handleDemandInput(key, value) {
+            state.demandForm[key] = value;
+            // Force re-render to update units if product changes
+            if(key === 'product_id') render();
+        }
+
+        async function submitDemand() {
+            const { lead_id, product_id, quantity } = state.demandForm;
+            
+            if (!product_id || !quantity) return showToast('انتخاب کالا و تعداد الزامی است', 'error');
+
+            updateState({ isSaving: true });
+
+            const payload = {
+                lead_id: lead_id,
+                product_id: product_id,
+                quantity: parseFloat(quantity),
+                visitor_name: state.currentUser.name
+            };
+
+            const { data, error } = await supabase.from('demands').insert([payload]).select();
+
+            updateState({ isSaving: false });
+
+            if (error) {
+                console.error('Demand Error:', error);
+                showToast('خطا در ثبت سفارش: ' + error.message, 'error');
+            } else {
+                state.demands = [data[0], ...state.demands]; // Update local state
+                showToast('سفارش با موفقیت ثبت شد', 'success');
+                updateState({ showDemandModal: false });
+            }
+        }
+
+        // --- MANAGER: PRODUCT CRUD ---
+
+        function openProductModal(product = null) {
+            const defaultCat = state.categories.length > 0 ? state.categories[0].id : '';
+            updateState({
+                showProductModal: true,
+                productForm: product 
+                    ? { ...product }
+                    : { id: null, name: '', unit: 'pcs', business_category_id: defaultCat, preffered_price: '' }
+            });
+        }
+
+        async function saveProduct() {
+            const { id, name, unit, business_category_id, preffered_price } = state.productForm;
+            if (!name || !business_category_id) return showToast('نام کالا و دسته‌بندی الزامی است', 'error');
+
+            const payload = {
+                name,
+                unit,
+                business_category_id,
+                preffered_price: preffered_price || null
+            };
+
+            let result;
+            if (id) {
+                result = await supabase.from('products').update(payload).eq('id', id).select();
+            } else {
+                result = await supabase.from('products').insert([payload]).select();
+            }
+
+            const { data, error } = result;
+
+            if (error) {
+                showToast('خطا: ' + error.message, 'error');
+            } else {
+                if (id) {
+                    state.products = state.products.map(p => p.id === id ? data[0] : p);
+                } else {
+                    state.products = [...state.products, data[0]];
+                }
+                updateState({ showProductModal: false });
+                showToast('محصول ذخیره شد', 'success');
+            }
+        }
+
+        async function deleteProduct(id) {
+            if (!confirm('آیا از حذف این محصول اطمینان دارید؟')) return;
+            const { error } = await supabase.from('products').delete().eq('id', id);
+            if (error) {
+                showToast('خطا (ممکن است در سفارشات استفاده شده باشد)', 'error');
+            } else {
+                state.products = state.products.filter(p => p.id !== id);
+                render();
+                showToast('محصول حذف شد', 'success');
+            }
+        }
+
 
         // --- MANAGER: VISITOR CRUD ---
 
@@ -324,9 +470,9 @@
                 business_name: formData.business_name,
                 contact_name: formData.contact_name,
                 phone: formData.phone,
-                activity_type_id: formData.activity_type_id || null, // UUID
+                activity_type_id: formData.activity_type_id || null, 
                 city: formData.city,
-                business_category_id: formData.business_category_id, // UUID Not Null
+                business_category_id: formData.business_category_id, 
                 user_name: formData.user_name || state.currentUser.name
             };
 
@@ -442,6 +588,29 @@
             return act ? act.name : '---';
         }
 
+        function getProductName(id) {
+            if (!id) return '';
+            const prod = state.products.find(p => p.id === id);
+            return prod ? prod.name : 'محصول حذف شده';
+        }
+
+        function getProductUnitLabel(id) {
+            const prod = state.products.find(p => p.id === id);
+            if(!prod) return '';
+            return PRODUCT_UNITS.find(u => u.id === prod.unit)?.label.split(' ')[0] || prod.unit;
+        }
+
+        function getLeadName(id) {
+            const lead = state.leads.find(l => l.id === id);
+            return lead ? lead.business_name : 'نامشخص';
+        }
+
+        function formatDate(dateStr) {
+            if (!dateStr) return '';
+            const d = new Date(dateStr);
+            return d.toLocaleDateString('fa-IR');
+        }
+
         // --- TEMPLATES ---
 
         function getLoginHTML() {
@@ -474,26 +643,44 @@
             const list = state.leads.map(lead => {
                 const categoryName = getCategoryName(lead.business_category_id);
                 const activityName = getActivityName(lead.activity_type_id);
+                const safeName = lead.business_name.replace(/'/g, "\\'"); 
+                const catId = lead.business_category_id || '';
                 return `
-                <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center mb-3">
-                    <div>
-                        <div class="font-bold text-gray-800">${lead.business_name}</div>
-                        <div class="text-sm text-gray-500 flex items-center gap-2 mt-1">
-                            <i data-lucide="user" class="w-3 h-3"></i> ${lead.contact_name || '---'}
+                <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-3 relative group">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <div class="font-bold text-gray-800 text-lg">${lead.business_name}</div>
+                            <div class="text-sm text-gray-500 flex items-center gap-2 mt-1">
+                                <i data-lucide="user" class="w-3 h-3"></i> ${lead.contact_name || '---'}
+                            </div>
+                            <div class="text-xs text-gray-400 mt-2 flex items-center gap-2">
+                                 <span class="flex items-center gap-1"><i data-lucide="map-pin" class="w-3 h-3"></i> ${CITIES.find(c => c.id === lead.city)?.label || lead.city}</span>
+                                 ${categoryName ? `<span class="flex items-center gap-1 bg-gray-100 px-2 py-0.5 rounded text-gray-600"><i data-lucide="tag" class="w-3 h-3"></i> ${categoryName}</span>` : ''}
+                            </div>
                         </div>
-                        <div class="text-xs text-gray-400 mt-2 flex items-center gap-2">
-                             <span class="flex items-center gap-1"><i data-lucide="map-pin" class="w-3 h-3"></i> ${CITIES.find(c => c.id === lead.city)?.label || lead.city}</span>
-                             ${categoryName ? `<span class="flex items-center gap-1 bg-gray-100 px-2 py-0.5 rounded text-gray-600"><i data-lucide="tag" class="w-3 h-3"></i> ${categoryName}</span>` : ''}
+                        <div class="flex flex-col items-end gap-2">
+                            <span class="text-xs bg-blue-50 text-blue-700 px-3 py-1 rounded-lg">
+                                ${activityName}
+                            </span>
+                            <button onclick="openDemandModal('${lead.id}', '${safeName}', '${catId}')" class="flex items-center gap-1 bg-green-50 text-green-700 px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-green-100 transition-colors border border-green-200 mt-2">
+                                <i data-lucide="shopping-cart" class="w-3 h-3"></i> ثبت سفارش
+                            </button>
                         </div>
                     </div>
-                    <span class="text-xs bg-blue-50 text-blue-700 px-3 py-1 rounded-lg">
-                        ${activityName}
-                    </span>
                 </div>
             `}).join('');
 
+            // Filter products for the modal based on selected lead's category
+            const filteredProducts = state.demandForm.lead_category_id 
+                ? state.products.filter(p => p.business_category_id === state.demandForm.lead_category_id)
+                : state.products;
+
+            // Find selected product unit
+            const selectedProduct = state.products.find(p => p.id === state.demandForm.product_id);
+            const unitLabel = selectedProduct ? (PRODUCT_UNITS.find(u => u.id === selectedProduct.unit)?.label || selectedProduct.unit) : '';
+
             return `
-            <div class="h-full flex flex-col bg-slate-100 page-enter">
+            <div class="h-full flex flex-col bg-slate-100 page-enter relative">
                 <header class="bg-blue-800 text-white p-6 rounded-b-[2.5rem] shadow-lg mb-4 shrink-0">
                    <div class="flex justify-between items-center mb-6">
                       <div class="flex items-center gap-3">
@@ -508,17 +695,59 @@
                      <button onclick="goToAddLead()" class="bg-white text-blue-800 p-4 rounded-2xl shadow-xl flex items-center gap-3 w-full justify-center border-2 border-blue-50 active:scale-95 transition-transform"><div class="bg-blue-100 p-2 rounded-full"><i data-lucide="plus" class="w-6 h-6"></i></div><span class="font-bold text-lg">ثبت مشتری جدید</span></button>
                 </div>
                 <div class="flex-1 px-4 pb-6 overflow-y-auto no-scrollbar">${state.isLoadingData ? '<div class="text-center py-10 text-gray-400">...</div>' : list}</div>
+
+                <!-- DEMAND MODAL -->
+                ${state.showDemandModal ? `
+                <div class="fixed inset-0 bg-black/60 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 page-enter">
+                    <div class="bg-white rounded-t-3xl sm:rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden modal-enter">
+                        <div class="p-4 border-b bg-green-50 flex justify-between items-center">
+                            <h3 class="font-bold text-green-900 flex gap-2 items-center"><i data-lucide="shopping-bag" class="w-5 h-5"></i> ثبت سفارش</h3>
+                            <button onclick="updateState({showDemandModal: false})" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-5 h-5"></i></button>
+                        </div>
+                        <div class="p-6 space-y-4">
+                            <div class="text-sm text-gray-500 mb-2">مشتری: <strong class="text-gray-800">${state.demandForm.lead_name}</strong></div>
+                            
+                            <div class="space-y-2">
+                                <label class="text-xs font-bold text-gray-500 block mr-1">انتخاب کالا</label>
+                                <div class="relative">
+                                    <select onchange="handleDemandInput('product_id', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-green-500 outline-none">
+                                        <option value="">انتخاب کنید...</option>
+                                        ${filteredProducts.length > 0 
+                                            ? filteredProducts.map(p => `<option value="${p.id}" ${state.demandForm.product_id === p.id ? 'selected' : ''}>${p.name}</option>`).join('')
+                                            : `<option disabled>محصولی برای این دسته یافت نشد</option>`
+                                        }
+                                    </select>
+                                    <i data-lucide="package" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                                </div>
+                            </div>
+
+                            <div class="space-y-1">
+                                <label class="text-xs font-bold text-gray-500 block mr-1">تعداد ${unitLabel ? `(${unitLabel})` : ''}</label>
+                                <div class="relative">
+                                    <input type="number" value="${state.demandForm.quantity}" oninput="handleDemandInput('quantity', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 pr-10 focus:border-green-500 outline-none" dir="rtl" />
+                                    <i data-lucide="hash" class="absolute right-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                                </div>
+                            </div>
+                            
+                            <div class="flex gap-3 pt-4">
+                                <button onclick="updateState({showDemandModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100 font-medium">انصراف</button>
+                                <button onclick="submitDemand()" class="flex-1 py-3 rounded-xl bg-green-600 text-white shadow-lg font-bold flex justify-center items-center gap-2">
+                                    ${state.isSaving ? '<i data-lucide="loader-2" class="animate-spin w-5 h-5"></i>' : '<span>ثبت نهایی</span> <i data-lucide="check" class="w-4 h-4"></i>'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                ` : ''}
             </div>`;
         }
 
         function getVisitorAddHTML() {
-            // Re-using the same form logic as visitor-home but standalone
             return getCommonLeadFormHTML('visitor-home', 'form', 'submitLead', 'handleLeadInput', 'submit-lead-btn', 'lead-helper-text');
         }
 
-        // Shared Form Generator to reuse code between Visitor Add and Manager Add/Edit
+        // Shared Form Generator
         function getCommonLeadFormHTML(backView, stateKey, submitFn, inputHandler, btnId, helperId) {
-            // stateKey e.g. 'form' (visitor) or 'leadForm' (manager)
             const formData = state[stateKey];
             const isManager = stateKey === 'leadForm';
             
@@ -617,6 +846,42 @@
                         <div class="overflow-x-auto"><table class="w-full text-right text-sm"><thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">کسب‌وکار</th><th class="px-4 py-3 hidden md:table-cell">مخاطب</th><th class="px-4 py-3">فعالیت</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">عملیات</th></tr></thead><tbody>${leadsTable}</tbody></table></div>
                     </div>
                 `;
+            } else if (activeTab === 'demands') {
+                 const demandsList = state.demands.map(d => {
+                    const leadName = getLeadName(d.lead_id);
+                    const productName = getProductName(d.product_id);
+                    const unit = getProductUnitLabel(d.product_id);
+                    const date = formatDate(d.created_at);
+                    
+                    return `
+                    <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0">
+                        <td class="px-4 py-3 font-bold text-gray-800">${leadName}</td>
+                        <td class="px-4 py-3 text-gray-700">${productName}</td>
+                        <td class="px-4 py-3 font-medium text-blue-700">${d.quantity} <span class="text-xs text-gray-500">${unit}</span></td>
+                        <td class="px-4 py-3 text-sm text-gray-500">${d.visitor_name || '-'}</td>
+                        <td class="px-4 py-3 text-sm text-gray-400 dir-ltr text-right">${date}</td>
+                    </tr>`;
+                }).join('');
+
+                content = `
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100"><div class="text-gray-500 text-xs">کل سفارشات</div><div class="text-2xl font-bold text-gray-800">${state.demands.length}</div></div>
+                    </div>
+                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                         <div class="p-4 border-b bg-gray-50/50">
+                            <h2 class="font-bold text-gray-800 flex items-center gap-2"><i data-lucide="shopping-bag" class="w-4 h-4 text-green-600"></i> سفارشات ثبت شده</h2>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-right text-sm">
+                                <thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">مشتری</th><th class="px-4 py-3">کالا</th><th class="px-4 py-3">تعداد</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">تاریخ</th></tr></thead>
+                                <tbody>
+                                    ${demandsList.length ? demandsList : '<tr><td colspan="5" class="px-4 py-8 text-center text-gray-400">هنوز سفارشی ثبت نشده است</td></tr>'}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+
             } else if (activeTab === 'visitors') {
                 const visitorsList = state.users.map(user => {
                     const cleanUser = JSON.stringify(user).replace(/"/g, '&quot;');
@@ -642,6 +907,46 @@
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">${visitorsList}</div>
                 `;
+            } else if (activeTab === 'products') {
+                const productList = state.products.map(prod => {
+                    const cleanProd = JSON.stringify(prod).replace(/"/g, '&quot;');
+                    const catName = getCategoryName(prod.business_category_id);
+                    const unitLabel = PRODUCT_UNITS.find(u => u.id === prod.unit)?.label.split(' ')[0] || prod.unit;
+                    
+                    return `
+                    <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0 group">
+                        <td class="px-4 py-3">
+                            <div class="font-bold text-gray-800">${prod.name}</div>
+                            <div class="text-xs text-gray-400">${catName}</div>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-600">${unitLabel}</td>
+                        <td class="px-4 py-3 text-sm text-gray-600">${prod.preffered_price ? parseInt(prod.preffered_price).toLocaleString() : '-'}</td>
+                        <td class="px-4 py-3">
+                             <div class="flex gap-2">
+                                <button onclick="openProductModal(${cleanProd})" class="p-1.5 text-blue-600 bg-blue-50 rounded hover:bg-blue-100"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                                <button onclick="deleteProduct('${prod.id}')" class="p-1.5 text-red-600 bg-red-50 rounded hover:bg-red-100"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                        </td>
+                    </tr>`;
+                }).join('');
+
+                content = `
+                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
+                            <h2 class="font-bold text-gray-800">محصولات</h2>
+                            <button onclick="openProductModal()" class="bg-indigo-600 text-white px-3 py-1.5 rounded-lg text-xs flex gap-1 hover:bg-indigo-700 shadow-lg shadow-indigo-100"><i data-lucide="plus" class="w-3 h-3"></i> افزودن کالا</button>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-right text-sm">
+                                <thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">نام کالا</th><th class="px-4 py-3">واحد</th><th class="px-4 py-3">قیمت (ریال)</th><th class="px-4 py-3">عملیات</th></tr></thead>
+                                <tbody>
+                                    ${productList.length ? productList : '<tr><td colspan="4" class="px-4 py-8 text-center text-gray-400">هیچ محصولی یافت نشد</td></tr>'}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+
             } else if (activeTab === 'settings') {
                 const categoriesList = state.categories.map(cat => {
                     const cleanName = cat.name.replace(/'/g, "\\'");
@@ -673,7 +978,9 @@
                 </nav>
                 <div class="bg-white border-b px-6 pt-2 overflow-x-auto"><div class="flex gap-6 min-w-max">
                     <button onclick="updateState({managerTab: 'leads'})" class="pb-3 text-sm border-b-2 transition-colors ${activeTab === 'leads' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}">گزارش‌ها</button>
+                    <button onclick="updateState({managerTab: 'demands'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'demands' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="shopping-bag" class="w-4 h-4"></i> سفارشات</button>
                     <button onclick="updateState({managerTab: 'visitors'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'visitors' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="users" class="w-4 h-4"></i> ویزیتورها</button>
+                    <button onclick="updateState({managerTab: 'products'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'products' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="package" class="w-4 h-4"></i> محصولات</button>
                     <button onclick="updateState({managerTab: 'settings'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'settings' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="settings" class="w-4 h-4"></i> تنظیمات</button>
                 </div></div>
                 <div class="flex-1 p-6 w-full max-w-4xl mx-auto overflow-y-auto">${content}</div>
@@ -700,6 +1007,40 @@
                             <div class="p-5">
                                 ${getCommonLeadFormHTML(null, 'leadForm', 'saveManagerLead', 'handleManagerLeadInput', '', '')}
                                 <div class="flex gap-3 pt-4"><button onclick="updateState({showLeadModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100">انصراف</button><button onclick="saveManagerLead()" class="flex-1 py-3 rounded-xl bg-blue-600 text-white shadow-lg">ذخیره</button></div>
+                            </div>
+                        </div>
+                    </div>` : ''}
+
+                ${state.showProductModal ? `
+                    <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 page-enter">
+                        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden modal-enter">
+                            <div class="p-4 border-b bg-indigo-50 flex justify-between items-center"><h3 class="font-bold text-indigo-900 flex gap-2"><i data-lucide="package" class="w-5 h-5"></i> ${state.productForm.id ? 'ویرایش محصول' : 'افزودن محصول'}</h3><button onclick="updateState({showProductModal: false})" class="text-gray-400"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+                            <div class="p-5 space-y-4">
+                                ${renderSimpleInput('productForm.name', 'نام کالا', 'type', 'text', 'handleProductInput')}
+                                
+                                <div class="space-y-1">
+                                    <label class="text-xs font-bold text-gray-500 block mr-1">واحد شمارش</label>
+                                    <div class="relative">
+                                        <select onchange="handleProductInput('unit', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-indigo-500 outline-none">
+                                            ${PRODUCT_UNITS.map(u => `<option value="${u.id}" ${state.productForm.unit === u.id ? 'selected' : ''}>${u.label}</option>`).join('')}
+                                        </select>
+                                        <i data-lucide="scale" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                                    </div>
+                                </div>
+
+                                <div class="space-y-1">
+                                    <label class="text-xs font-bold text-gray-500 block mr-1">دسته‌بندی</label>
+                                    <div class="relative">
+                                        <select onchange="handleProductInput('business_category_id', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-indigo-500 outline-none">
+                                            ${state.categories.map(c => `<option value="${c.id}" ${state.productForm.business_category_id === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+                                        </select>
+                                        <i data-lucide="tag" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                                    </div>
+                                </div>
+
+                                ${renderSimpleInput('productForm.preffered_price', 'قیمت (اختیاری)', 'dollar-sign', 'number', 'handleProductInput')}
+
+                                <div class="flex gap-3 pt-2"><button onclick="updateState({showProductModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100">انصراف</button><button onclick="saveProduct()" class="flex-1 py-3 rounded-xl bg-indigo-600 text-white shadow-lg">ذخیره</button></div>
                             </div>
                         </div>
                     </div>` : ''}
@@ -740,8 +1081,14 @@
         window.handleCategoryInput = function(key, value) { state.categoryForm[key] = value; }
         window.handleLoginInput = function(key, value) { state.loginForm[key] = value; document.getElementById('login-btn').disabled = !(state.loginForm.username && state.loginForm.password); }
         window.handleManagerLeadInput = function(key, value) { state.leadForm[key] = value; }
+        window.handleProductInput = function(key, value) { state.productForm[key] = value; }
         window.handleLeadInput = handleLeadInput;
         
+        // Demand Exports
+        window.openDemandModal = openDemandModal;
+        window.handleDemandInput = handleDemandInput;
+        window.submitDemand = submitDemand;
+
         window.openVisitorModal = openVisitorModal;
         window.saveVisitor = saveVisitor;
         window.deleteVisitor = deleteVisitor;
@@ -749,6 +1096,10 @@
         window.openLeadModal = openLeadModal;
         window.saveManagerLead = saveManagerLead;
         window.deleteLead = deleteLead;
+
+        window.openProductModal = openProductModal;
+        window.saveProduct = saveProduct;
+        window.deleteProduct = deleteProduct;
         
         window.openCategoryModal = openCategoryModal;
         window.saveCategory = saveCategory;
