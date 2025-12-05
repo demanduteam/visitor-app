@@ -54,13 +54,6 @@
         }
 
         // --- CONSTANTS ---
-        const SECTORS = [
-            { id: 'retail', label: 'خرده‌فروش (Retail)' },
-            { id: 'wholesale', label: 'عمده‌فروش (Wholesale)' },
-            { id: 'distribution', label: 'پخش (Distribution)' },
-            { id: 'horeca', label: 'هتل/رستوران (Horeca)' }
-        ];
-
         const CITIES = [
             { id: 'ahvaz', label: 'اهواز' },
             { id: 'tehran', label: 'تهران' },
@@ -76,7 +69,8 @@
             currentUser: null,
             leads: [],
             users: [],
-            categories: [], 
+            categories: [], // Fetched from business_categories
+            activityTypes: [], // Fetched from activity_types
             
             // Login
             loginForm: { username: '', password: '' },
@@ -93,7 +87,7 @@
 
             // Manager: Lead CRUD
             showLeadModal: false,
-            leadForm: { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type: 'retail', business_category_id: '' },
+            leadForm: { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type_id: '', business_category_id: '' },
 
             // Settings (Categories CRUD)
             showCategoryModal: false,
@@ -105,7 +99,7 @@
                 business_name: '',
                 contact_name: '',
                 phone: '',
-                activity_type: 'retail',
+                activity_type_id: '', // Changed to ID
                 business_category_id: '' 
             },
             isSaving: false,
@@ -167,12 +161,19 @@
             if (!state.currentUser) return;
             updateState({ isLoadingData: true });
             
+            // 1. Fetch Categories
             const { data: catData } = await supabase.from('business_categories').select('*').order('name');
             if (catData) state.categories = catData;
 
+            // 2. Fetch Activity Types (Replaces hardcoded SECTORS)
+            const { data: actData } = await supabase.from('activity_types').select('*').order('name');
+            if (actData) state.activityTypes = actData;
+
+            // 3. Fetch Leads
             const { data: leadsData } = await supabase.from('leads').select('*').order('created_at', { ascending: false });
             state.leads = leadsData || [];
 
+            // 4. Fetch Users (Manager Only)
             if (state.currentUser.role === 'manager') {
                 const { data: usersData } = await supabase.from('users').select('*').eq('role', 'visitor');
                 state.users = usersData || [];
@@ -190,9 +191,11 @@
 
         function goToAddLead() {
             const defaultCat = state.categories.length > 0 ? state.categories[0].id : '';
+            const defaultAct = state.activityTypes.length > 0 ? state.activityTypes[0].id : '';
+            
             updateState({ 
                 view: 'visitor-add',
-                form: { city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type: 'retail', business_category_id: defaultCat }
+                form: { city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type_id: defaultAct, business_category_id: defaultCat }
             });
         }
 
@@ -200,7 +203,7 @@
             state.form[key] = value;
             const btn = document.getElementById('submit-lead-btn');
             const helper = document.getElementById('lead-helper-text');
-            const isValid = state.form.business_name && state.form.phone;
+            const isValid = state.form.business_name && state.form.phone && state.form.business_category_id;
             if(btn) btn.disabled = !isValid;
             if(helper) helper.style.display = isValid ? 'none' : 'block';
         }
@@ -213,20 +216,23 @@
 
         async function submitLead() {
             updateState({ isSaving: true });
+            
+            // Prepare payload matching new schema
             const newLead = {
                 business_name: state.form.business_name,
                 contact_name: state.form.contact_name,
                 phone: state.form.phone,
-                activity_type: state.form.activity_type,
+                activity_type_id: state.form.activity_type_id || null, // UUID now
                 city: state.form.city,
                 user_name: state.currentUser.name,
-                business_category_id: state.form.business_category_id || null
+                business_category_id: state.form.business_category_id // UUID Not Null
             };
 
             const { data, error } = await supabase.from('leads').insert([newLead]).select();
 
             if (error) {
-                showToast('خطا در ذخیره اطلاعات', 'error');
+                console.error(error);
+                showToast('خطا در ذخیره: ' + error.message, 'error');
                 updateState({ isSaving: false });
             } else {
                 state.leads = [data[0], ...state.leads];
@@ -256,14 +262,12 @@
                 role: 'visitor',
                 region: region || 'نامشخص'
             };
-            if (password) userData.password = password; // Only update password if provided during edit
+            if (password) userData.password = password; 
 
             let result;
             if (id) {
-                // Update
                 result = await supabase.from('users').update(userData).eq('id', id).select();
             } else {
-                // Insert
                 if (!password) return showToast('رمز عبور الزامی است', 'error');
                 userData.password = password;
                 result = await supabase.from('users').insert([userData]).select();
@@ -302,11 +306,13 @@
 
         function openLeadModal(lead = null) {
             const defaultCat = state.categories.length > 0 ? state.categories[0].id : '';
+            const defaultAct = state.activityTypes.length > 0 ? state.activityTypes[0].id : '';
+
             updateState({
                 showLeadModal: true,
                 leadForm: lead 
                     ? { ...lead } 
-                    : { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type: 'retail', business_category_id: defaultCat, user_name: state.currentUser.name }
+                    : { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type_id: defaultAct, business_category_id: defaultCat, user_name: state.currentUser.name }
             });
         }
 
@@ -314,30 +320,27 @@
             const formData = state.leadForm;
             if (!formData.business_name || !formData.phone) return;
 
-            // Prepare payload (remove id if null for insert, keep for reference logic)
             const payload = {
                 business_name: formData.business_name,
                 contact_name: formData.contact_name,
                 phone: formData.phone,
-                activity_type: formData.activity_type,
+                activity_type_id: formData.activity_type_id || null, // UUID
                 city: formData.city,
-                business_category_id: formData.business_category_id || null,
+                business_category_id: formData.business_category_id, // UUID Not Null
                 user_name: formData.user_name || state.currentUser.name
             };
 
             let result;
             if (formData.id) {
-                // Update
                 result = await supabase.from('leads').update(payload).eq('id', formData.id).select();
             } else {
-                // Insert
                 result = await supabase.from('leads').insert([payload]).select();
             }
 
             const { data, error } = result;
 
             if (error) {
-                showToast('خطا در ذخیره لید', 'error');
+                showToast('خطا: ' + error.message, 'error');
             } else {
                 if (formData.id) {
                     state.leads = state.leads.map(l => l.id === formData.id ? data[0] : l);
@@ -394,7 +397,7 @@
                     state.categories = [...state.categories, data[0]];
                 }
                 updateState({ showCategoryModal: false });
-                showToast('دسته&zwnj;بندی ذخیره شد', 'success');
+                showToast('دسته‌بندی ذخیره شد', 'success');
             }
         }
 
@@ -433,6 +436,12 @@
             return cat ? cat.name : '';
         }
 
+        function getActivityName(id) {
+            if (!id) return '---';
+            const act = state.activityTypes.find(a => a.id === id);
+            return act ? act.name : '---';
+        }
+
         // --- TEMPLATES ---
 
         function getLoginHTML() {
@@ -464,6 +473,7 @@
         function getVisitorHomeHTML() {
             const list = state.leads.map(lead => {
                 const categoryName = getCategoryName(lead.business_category_id);
+                const activityName = getActivityName(lead.activity_type_id);
                 return `
                 <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center mb-3">
                     <div>
@@ -477,7 +487,7 @@
                         </div>
                     </div>
                     <span class="text-xs bg-blue-50 text-blue-700 px-3 py-1 rounded-lg">
-                        ${SECTORS.find(t => t.id === lead.activity_type)?.label.split(' ')[0] || '---'}
+                        ${activityName}
                     </span>
                 </div>
             `}).join('');
@@ -536,14 +546,15 @@
                     <div class="space-y-2">
                         <label class="text-xs font-bold text-gray-500 block mr-1">نوع فعالیت</label>
                         <div class="relative">
-                            <select onchange="${inputHandler}('activity_type', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
-                                ${SECTORS.map(s => `<option value="${s.id}" ${formData.activity_type === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}
+                            <select onchange="${inputHandler}('activity_type_id', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
+                                <option value="">انتخاب کنید...</option>
+                                ${state.activityTypes.map(s => `<option value="${s.id}" ${formData.activity_type_id === s.id ? 'selected' : ''}>${s.name}</option>`).join('')}
                             </select>
                             <i data-lucide="briefcase" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
                         </div>
                     </div>
                     <div class="space-y-2">
-                        <label class="text-xs font-bold text-gray-500 block mr-1">دسته‌بندی محصولات</label>
+                        <label class="text-xs font-bold text-gray-500 block mr-1">دسته‌بندی محصولات <span class="text-red-500">*</span></label>
                         <div class="relative">
                             <select onchange="${inputHandler}('business_category_id', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
                                 <option value="">انتخاب کنید...</option>
@@ -554,8 +565,8 @@
                     </div>
                     
                     ${!isManager ? `<div>
-                        <p id="${helperId}" class="text-xs text-red-500 text-center mb-2 ${formData.business_name && formData.phone ? 'hidden' : ''}">نام و موبایل الزامی است.</p>
-                        <button id="${btnId}" onclick="${submitFn}()" ${(formData.business_name && formData.phone) ? '' : 'disabled'} class="w-full flex items-center justify-center gap-2 px-4 py-4 rounded-xl font-bold text-lg bg-blue-800 text-white shadow-lg disabled:opacity-50 transition-all active:scale-95">
+                        <p id="${helperId}" class="text-xs text-red-500 text-center mb-2 ${formData.business_name && formData.phone && formData.business_category_id ? 'hidden' : ''}">نام، موبایل و دسته‌بندی الزامی است.</p>
+                        <button id="${btnId}" onclick="${submitFn}()" ${(formData.business_name && formData.phone && formData.business_category_id) ? '' : 'disabled'} class="w-full flex items-center justify-center gap-2 px-4 py-4 rounded-xl font-bold text-lg bg-blue-800 text-white shadow-lg disabled:opacity-50 transition-all active:scale-95">
                             ${state.isSaving ? '<i data-lucide="loader-2" class="animate-spin"></i>' : '<i data-lucide="send"></i> ثبت اطلاعات'}
                         </button>
                     </div>` : ''}
@@ -569,9 +580,10 @@
             let content = '';
 
             if (activeTab === 'leads') {
-                const leadsTable = state.leads.filter(l => state.managerFilter === 'all' || l.activity_type === state.managerFilter).map(lead => {
+                const leadsTable = state.leads.filter(l => state.managerFilter === 'all' || l.activity_type_id === state.managerFilter).map(lead => {
                     const cleanLead = JSON.stringify(lead).replace(/"/g, '&quot;');
                     const categoryName = getCategoryName(lead.business_category_id);
+                    const activityName = getActivityName(lead.activity_type_id);
                     return `
                     <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0 group">
                         <td class="px-4 py-3">
@@ -579,7 +591,7 @@
                             ${categoryName ? `<div class="text-[10px] text-gray-500 bg-gray-100 inline-block px-1 rounded mt-1">${categoryName}</div>` : ''}
                         </td>
                         <td class="px-4 py-3 text-gray-600 hidden md:table-cell">${lead.contact_name || '-'}</td>
-                        <td class="px-4 py-3"><span class="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs">${SECTORS.find(s=>s.id===lead.activity_type)?.label.split(' ')[0] || '-'}</span></td>
+                        <td class="px-4 py-3"><span class="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs">${activityName}</span></td>
                         <td class="px-4 py-3 text-sm text-gray-500">${lead.user_name || '-'}</td>
                         <td class="px-4 py-3">
                             <div class="flex gap-2 opacity-100 md:opacity-0 group-hover:opacity-100 transition-opacity">
@@ -600,7 +612,7 @@
                                 <h2 class="font-bold">مشتریان</h2>
                                 <button onclick="openLeadModal()" class="bg-purple-50 text-purple-700 p-1.5 rounded-lg hover:bg-purple-100"><i data-lucide="plus" class="w-4 h-4"></i></button>
                             </div>
-                            <select onchange="updateState({managerFilter: this.value})" class="bg-gray-50 border rounded-lg px-2 py-1 text-sm"><option value="all">همه</option>${SECTORS.map(s => `<option value="${s.id}">${s.label}</option>`).join('')}</select>
+                            <select onchange="updateState({managerFilter: this.value})" class="bg-gray-50 border rounded-lg px-2 py-1 text-sm"><option value="all">همه</option>${state.activityTypes.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
                         </div>
                         <div class="overflow-x-auto"><table class="w-full text-right text-sm"><thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">کسب‌وکار</th><th class="px-4 py-3 hidden md:table-cell">مخاطب</th><th class="px-4 py-3">فعالیت</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">عملیات</th></tr></thead><tbody>${leadsTable}</tbody></table></div>
                     </div>
