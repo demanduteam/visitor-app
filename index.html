@@ -75,11 +75,21 @@
             { id: 'meter', label: 'متر (Meter)' }
         ];
 
-        // NEW: Status Definitions
-        const DEMAND_STATUSES = [
-            { id: 'registered', label: 'ثبت شده', color: 'bg-yellow-100 text-yellow-800 border-yellow-200' },
-            { id: 'invoiced', label: 'فاکتور و تحویل', color: 'bg-blue-100 text-blue-800 border-blue-200' },
-            { id: 'paid', label: 'تسویه شده', color: 'bg-green-100 text-green-800 border-green-200' }
+        const PAYMENT_METHODS = [
+            { id: 'cash', label: 'نقد (Cash)' },
+            { id: 'pos', label: 'کارتخوان (POS)' },
+            { id: 'cheque', label: 'چک (Cheque)' },
+            { id: 'transfer', label: 'کارت به کارت' }
+        ];
+
+        // Style presets for new statuses
+        const STATUS_COLOR_PRESETS = [
+            { id: 'bg-gray-100 text-gray-800 border-gray-200', label: 'خاکستری' },
+            { id: 'bg-yellow-100 text-yellow-800 border-yellow-200', label: 'زرد (هشدار)' },
+            { id: 'bg-blue-100 text-blue-800 border-blue-200', label: 'آبی (اطلاعات)' },
+            { id: 'bg-green-100 text-green-800 border-green-200', label: 'سبز (موفق)' },
+            { id: 'bg-red-100 text-red-800 border-red-200', label: 'قرمز (خطر)' },
+            { id: 'bg-purple-100 text-purple-800 border-purple-200', label: 'بنفش' }
         ];
 
         // --- STATE ---
@@ -93,6 +103,8 @@
             activityTypes: [], 
             products: [], 
             demands: [], 
+            payments: [], // NEW: Payments Data
+            statuses: [], 
             
             // Login
             loginForm: { username: '', password: '' },
@@ -122,6 +134,10 @@
             showCategoryModal: false,
             categoryForm: { id: null, name: '' },
 
+            // Settings (Status CRUD)
+            showStatusModal: false,
+            statusForm: { id: null, code: '', label: '', color: '', sort_order: '' },
+
             // Visitor App Form
             form: {
                 city: 'ahvaz',
@@ -142,9 +158,13 @@
                 quantity: ''
             },
 
-            // Demand Edit (Status, Price, Qty)
+            // Demand Edit
             showDemandEditModal: false,
             demandEditForm: { id: null, status: '', quantity: '', price: '', product_name: '', lead_name: '' },
+
+            // Payment Modal (NEW)
+            showPaymentModal: false,
+            paymentForm: { demand_id: null, amount: '', method: 'cash', reference_code: '', note: '' },
 
             isSaving: false,
             isLoadingData: false
@@ -205,7 +225,7 @@
             if (!state.currentUser) return;
             updateState({ isLoadingData: true });
             
-            // 0. Fetch Users Map (To resolve IDs to Names)
+            // 0. Fetch Users Map
             const { data: allUsers } = await supabase.from('users').select('id, name, role, username, region');
             if (allUsers) {
                 state.users = allUsers.filter(u => u.role === 'visitor'); // Keep list for manager
@@ -227,21 +247,29 @@
             const { data: prodData } = await supabase.from('products').select('*').order('name');
             if (prodData) state.products = prodData;
 
-            // 4. Fetch Leads
+            // 4. Fetch Statuses
+            const { data: statusData } = await supabase.from('demand_statuses').select('*').order('sort_order');
+            state.statuses = (statusData && statusData.length > 0) ? statusData : [
+                { code: 'registered', label: 'ثبت شده', color: 'bg-yellow-100 text-yellow-800 border-yellow-200' },
+                { code: 'invoiced', label: 'فاکتور و تحویل', color: 'bg-blue-100 text-blue-800 border-blue-200' },
+                { code: 'paid', label: 'تسویه شده', color: 'bg-green-100 text-green-800 border-green-200' }
+            ];
+
+            // 5. Fetch Leads
             let leadsQuery = supabase.from('leads').select('*').order('created_at', { ascending: false });
-            
-            // 🔒 SECURITY UPDATE: Filter by visitor_id
             if (state.currentUser.role === 'visitor') {
                 leadsQuery = leadsQuery.eq('visitor_id', state.currentUser.id);
             }
-
             const { data: leadsData } = await leadsQuery;
             state.leads = leadsData || [];
 
-            // 5. Fetch Demands (Order by created_at)
-            // Note: DB should have 'price' column now if SQL was run
+            // 6. Fetch Demands
             const { data: demandsData } = await supabase.from('demands').select('*').order('created_at', { ascending: false });
             state.demands = demandsData || [];
+
+            // 7. Fetch Payments (NEW)
+            const { data: paymentsData } = await supabase.from('payments').select('*').order('created_at', { ascending: false });
+            state.payments = paymentsData || [];
             
             updateState({ isLoadingData: false });
         }
@@ -251,7 +279,15 @@
             updateState({ currentUser: null, view: 'login', leads: [], users: [] });
         }
 
-        // --- VISITOR APP ACTIONS ---
+        // --- HELPERS ---
+        function calculateTotalPaid(demandId) {
+            if (!state.payments) return 0;
+            return state.payments
+                .filter(p => p.demand_id === demandId)
+                .reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+        }
+
+        // --- ACTIONS ---
 
         function goToAddLead() {
             const defaultCat = state.categories.length > 0 ? state.categories[0].id : '';
@@ -327,10 +363,10 @@
 
         async function submitDemand() {
             const { lead_id, product_id, quantity } = state.demandForm;
-            
             if (!product_id || !quantity) return showToast('انتخاب کالا و تعداد الزامی است', 'error');
 
             updateState({ isSaving: true });
+            const defaultStatus = state.statuses.length > 0 ? state.statuses[0].code : 'registered';
 
             const payload = {
                 lead_id: lead_id,
@@ -338,11 +374,10 @@
                 quantity: parseFloat(quantity),
                 visitor_name: state.currentUser.name,
                 visitor_id: state.currentUser.id,
-                status: 'registered' // Default Status
+                status: defaultStatus
             };
 
             const { data, error } = await supabase.from('demands').insert([payload]).select();
-
             updateState({ isSaving: false });
 
             if (error) {
@@ -355,10 +390,9 @@
             }
         }
 
-        // --- DEMAND EDIT (Log Logic) ---
+        // --- DEMAND EDIT & PAYMENTS ---
 
         function openDemandEditModal(demand) {
-            // Get names for display
             const prodName = getProductName(demand.product_id);
             const leadName = getLeadName(demand.lead_id);
 
@@ -366,7 +400,7 @@
                 showDemandEditModal: true,
                 demandEditForm: {
                     id: demand.id,
-                    status: demand.status || 'registered',
+                    status: demand.status || (state.statuses[0]?.code || 'registered'),
                     quantity: demand.quantity,
                     price: demand.price || '',
                     product_name: prodName,
@@ -381,55 +415,122 @@
 
         async function saveDemandEdit() {
             const { id, status, quantity, price } = state.demandEditForm;
-            
             if (!quantity) return showToast('تعداد نمی‌تواند خالی باشد', 'error');
 
             updateState({ isSaving: true });
-
             const updates = {
                 status: status,
                 quantity: parseFloat(quantity),
                 price: price ? parseFloat(price) : null
             };
 
-            const { data, error } = await supabase
-                .from('demands')
-                .update(updates)
-                .eq('id', id)
-                .select();
-
+            const { data, error } = await supabase.from('demands').update(updates).eq('id', id).select();
             updateState({ isSaving: false });
 
             if (error) {
                 showToast('خطا در ویرایش: ' + error.message, 'error');
             } else {
-                // Update local state
                 state.demands = state.demands.map(d => d.id === id ? data[0] : d);
                 updateState({ showDemandEditModal: false });
                 showToast('تغییرات ذخیره و لاگ شد', 'success');
             }
         }
         
-        // Quick Status Update (Legacy support, now redirects to modal or does simple update? 
-        // Let's keep it simple: Use Modal for everything now to allow Price/Qty edit)
-        // But for backward compat with my code below, let's keep it but make it trigger optimistic update + DB
         async function updateDemandStatus(demandId, newStatus) {
-            // 1. Optimistic Update
-            state.demands = state.demands.map(d => 
-                d.id === demandId ? { ...d, status: newStatus } : d
-            );
+            state.demands = state.demands.map(d => d.id === demandId ? { ...d, status: newStatus } : d);
             render();
+            const { error } = await supabase.from('demands').update({ status: newStatus }).eq('id', demandId);
+            if (error) showToast('خطا در بروزرسانی وضعیت', 'error');
+            else showToast('وضعیت تغییر یافت', 'success');
+        }
 
-            // 2. API Call
-            const { error } = await supabase
-                .from('demands')
-                .update({ status: newStatus })
-                .eq('id', demandId);
+        // --- PAYMENT ACTIONS (NEW) ---
+
+        function openPaymentModal(demandId) {
+            updateState({
+                showPaymentModal: true,
+                paymentForm: { demand_id: demandId, amount: '', method: 'cash', reference_code: '', note: '' }
+            });
+        }
+
+        function handlePaymentInput(key, value) {
+            state.paymentForm[key] = value;
+        }
+
+        async function submitPayment() {
+            const { demand_id, amount, method, reference_code, note } = state.paymentForm;
+            if (!amount || !method) return showToast('مبلغ و روش پرداخت الزامی است', 'error');
+
+            updateState({ isSaving: true });
+
+            const payload = {
+                demand_id,
+                amount: parseFloat(amount),
+                method,
+                reference_code,
+                note,
+                collected_by: state.currentUser.id
+            };
+
+            const { data, error } = await supabase.from('payments').insert([payload]).select();
+            updateState({ isSaving: false });
 
             if (error) {
-                showToast('خطا در بروزرسانی وضعیت', 'error');
+                showToast('خطا در ثبت پرداخت: ' + error.message, 'error');
             } else {
-                showToast('وضعیت تغییر یافت', 'success');
+                state.payments = [...state.payments, data[0]];
+                updateState({ showPaymentModal: false });
+                showToast('پرداخت با موفقیت ثبت شد', 'success');
+            }
+        }
+
+        // --- MANAGER: STATUS CRUD ---
+
+        function openStatusModal(status = null) {
+            updateState({
+                showStatusModal: true,
+                statusForm: status 
+                    ? { ...status }
+                    : { id: null, code: '', label: '', color: STATUS_COLOR_PRESETS[0].id, sort_order: '' }
+            });
+        }
+
+        function handleStatusInput(key, value) {
+            state.statusForm[key] = value;
+        }
+
+        async function saveStatus() {
+            const { id, code, label, color, sort_order } = state.statusForm;
+            if (!code || !label) return showToast('کد و عنوان الزامی است', 'error');
+
+            const payload = { code, label, color, sort_order: sort_order ? parseInt(sort_order) : 0 };
+            let result;
+            if (id) result = await supabase.from('demand_statuses').update(payload).eq('id', id).select();
+            else result = await supabase.from('demand_statuses').insert([payload]).select();
+
+            const { data, error } = result;
+            if (error) {
+                showToast('خطا: ' + error.message, 'error');
+            } else {
+                if (id) state.statuses = state.statuses.map(s => s.id === id ? data[0] : s);
+                else {
+                    state.statuses = [...state.statuses, data[0]];
+                    state.statuses.sort((a,b) => a.sort_order - b.sort_order);
+                }
+                updateState({ showStatusModal: false });
+                showToast('وضعیت ذخیره شد', 'success');
+            }
+        }
+
+        async function deleteStatus(id) {
+            if (!confirm('آیا مطمئن هستید؟')) return;
+            const { error } = await supabase.from('demand_statuses').delete().eq('id', id);
+            if (error) {
+                showToast('خطا در حذف', 'error');
+            } else {
+                state.statuses = state.statuses.filter(s => s.id !== id);
+                render();
+                showToast('حذف شد', 'success');
             }
         }
 
@@ -449,30 +550,16 @@
             const { id, name, unit, business_category_id, preffered_price } = state.productForm;
             if (!name || !business_category_id) return showToast('نام کالا و دسته‌بندی الزامی است', 'error');
 
-            const payload = {
-                name,
-                unit,
-                business_category_id,
-                preffered_price: preffered_price || null
-            };
-
+            const payload = { name, unit, business_category_id, preffered_price: preffered_price || null };
             let result;
-            if (id) {
-                result = await supabase.from('products').update(payload).eq('id', id).select();
-            } else {
-                result = await supabase.from('products').insert([payload]).select();
-            }
+            if (id) result = await supabase.from('products').update(payload).eq('id', id).select();
+            else result = await supabase.from('products').insert([payload]).select();
 
             const { data, error } = result;
-
-            if (error) {
-                showToast('خطا: ' + error.message, 'error');
-            } else {
-                if (id) {
-                    state.products = state.products.map(p => p.id === id ? data[0] : p);
-                } else {
-                    state.products = [...state.products, data[0]];
-                }
+            if (error) showToast('خطا: ' + error.message, 'error');
+            else {
+                if (id) state.products = state.products.map(p => p.id === id ? data[0] : p);
+                else state.products = [...state.products, data[0]];
                 updateState({ showProductModal: false });
                 showToast('محصول ذخیره شد', 'success');
             }
@@ -481,15 +568,13 @@
         async function deleteProduct(id) {
             if (!confirm('آیا از حذف این محصول اطمینان دارید؟')) return;
             const { error } = await supabase.from('products').delete().eq('id', id);
-            if (error) {
-                showToast('خطا (ممکن است در سفارشات استفاده شده باشد)', 'error');
-            } else {
+            if (error) showToast('خطا', 'error');
+            else {
                 state.products = state.products.filter(p => p.id !== id);
                 render();
                 showToast('محصول حذف شد', 'success');
             }
         }
-
 
         // --- MANAGER: VISITOR CRUD ---
 
@@ -506,34 +591,22 @@
             const { id, name, mobile, password, region } = state.visitorForm;
             if (!name || !mobile) return;
 
-            const userData = {
-                name,
-                username: mobile, // Mobile is username
-                role: 'visitor',
-                region: region || 'نامشخص'
-            };
+            const userData = { name, username: mobile, role: 'visitor', region: region || 'نامشخص' };
             if (password) userData.password = password; 
 
             let result;
-            if (id) {
-                result = await supabase.from('users').update(userData).eq('id', id).select();
-            } else {
+            if (id) result = await supabase.from('users').update(userData).eq('id', id).select();
+            else {
                 if (!password) return showToast('رمز عبور الزامی است', 'error');
                 userData.password = password;
                 result = await supabase.from('users').insert([userData]).select();
             }
 
             const { data, error } = result;
-
-            if (error) {
-                showToast('خطا: ' + error.message, 'error');
-            } else {
-                if (id) {
-                    state.users = state.users.map(u => u.id === id ? data[0] : u);
-                } else {
-                    state.users = [...state.users, data[0]];
-                }
-                // Refresh map if name changed
+            if (error) showToast('خطا: ' + error.message, 'error');
+            else {
+                if (id) state.users = state.users.map(u => u.id === id ? data[0] : u);
+                else state.users = [...state.users, data[0]];
                 state.userLookup[data[0].id] = data[0].name;
                 updateState({ showVisitorModal: false });
                 showToast(id ? 'ویزیتور ویرایش شد' : 'ویزیتور جدید ایجاد شد', 'success');
@@ -542,12 +615,9 @@
 
         async function deleteVisitor(id) {
             if (!confirm('آیا از حذف این حساب کاربری اطمینان دارید؟')) return;
-            
             const { error } = await supabase.from('users').delete().eq('id', id);
-            
-            if (error) {
-                showToast('خطا در حذف کاربر', 'error');
-            } else {
+            if (error) showToast('خطا در حذف کاربر', 'error');
+            else {
                 state.users = state.users.filter(u => u.id !== id);
                 render();
                 showToast('حساب کاربری حذف شد', 'success');
@@ -579,14 +649,12 @@
                 activity_type_id: formData.activity_type_id || null, 
                 city: formData.city,
                 business_category_id: formData.business_category_id, 
-                // Only set visitor info if it's a new record created by manager (as self) or if explicitly handled
                 visitor_name: formData.visitor_name || state.currentUser.name,
                 visitor_id: formData.visitor_id || state.currentUser.id
             };
 
             let result;
             if (formData.id) {
-                // Remove visitor_id from update payload to prevent changing owner accidentally
                 const { visitor_id, ...updatePayload } = payload;
                 result = await supabase.from('leads').update(updatePayload).eq('id', formData.id).select();
             } else {
@@ -594,15 +662,10 @@
             }
 
             const { data, error } = result;
-
-            if (error) {
-                showToast('خطا: ' + error.message, 'error');
-            } else {
-                if (formData.id) {
-                    state.leads = state.leads.map(l => l.id === formData.id ? data[0] : l);
-                } else {
-                    state.leads = [data[0], ...state.leads];
-                }
+            if (error) showToast('خطا: ' + error.message, 'error');
+            else {
+                if (formData.id) state.leads = state.leads.map(l => l.id === formData.id ? data[0] : l);
+                else state.leads = [data[0], ...state.leads];
                 updateState({ showLeadModal: false });
                 showToast(formData.id ? 'لید ویرایش شد' : 'لید جدید ثبت شد', 'success');
             }
@@ -610,12 +673,9 @@
 
         async function deleteLead(id) {
             if (!confirm('آیا از حذف این رکورد اطمینان دارید؟')) return;
-
             const { error } = await supabase.from('leads').delete().eq('id', id);
-
-            if (error) {
-                showToast('خطا در حذف رکورد', 'error');
-            } else {
+            if (error) showToast('خطا در حذف رکورد', 'error');
+            else {
                 state.leads = state.leads.filter(l => l.id !== id);
                 render();
                 showToast('رکورد حذف شد', 'success');
@@ -636,22 +696,14 @@
             if (!name.trim()) return;
 
             let result;
-            if (id) {
-                result = await supabase.from('business_categories').update({ name }).eq('id', id).select();
-            } else {
-                result = await supabase.from('business_categories').insert({ name }).select();
-            }
+            if (id) result = await supabase.from('business_categories').update({ name }).eq('id', id).select();
+            else result = await supabase.from('business_categories').insert({ name }).select();
 
             const { data, error } = result;
-
-            if (error) {
-                showToast('خطا در ذخیره', 'error');
-            } else {
-                if (id) {
-                    state.categories = state.categories.map(c => c.id === id ? data[0] : c);
-                } else {
-                    state.categories = [...state.categories, data[0]];
-                }
+            if (error) showToast('خطا در ذخیره', 'error');
+            else {
+                if (id) state.categories = state.categories.map(c => c.id === id ? data[0] : c);
+                else state.categories = [...state.categories, data[0]];
                 updateState({ showCategoryModal: false });
                 showToast('دسته‌بندی ذخیره شد', 'success');
             }
@@ -660,9 +712,8 @@
         async function deleteCategory(id) {
             if (!confirm('آیا اطمینان دارید؟')) return;
             const { error } = await supabase.from('business_categories').delete().eq('id', id);
-            if (error) {
-                showToast('خطا (شاید استفاده شده باشد)', 'error');
-            } else {
+            if (error) showToast('خطا (شاید استفاده شده باشد)', 'error');
+            else {
                 state.categories = state.categories.filter(c => c.id !== id);
                 render();
                 showToast('حذف شد', 'success');
@@ -715,7 +766,6 @@
             return lead ? lead.business_name : 'نامشخص';
         }
 
-        // Helper to get Visitor Name by ID (Fallback to stored text)
         function getVisitorName(id, fallbackName) {
             if (id && state.userLookup[id]) return state.userLookup[id];
             return fallbackName || 'ناشناس';
@@ -728,6 +778,42 @@
         }
 
         // --- TEMPLATES ---
+
+        function getPaymentModalHTML() {
+            if (!state.showPaymentModal) return '';
+            return `
+            <div class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 page-enter">
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden modal-enter">
+                    <div class="p-4 border-b bg-green-50 flex justify-between items-center">
+                        <h3 class="font-bold text-green-900 flex gap-2 items-center"><i data-lucide="banknote" class="w-5 h-5"></i> ثبت پرداخت</h3>
+                        <button onclick="updateState({showPaymentModal: false})" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-5 h-5"></i></button>
+                    </div>
+                    <div class="p-5 space-y-4">
+                        ${renderSimpleInput('paymentForm.amount', 'مبلغ (ریال)', 'dollar-sign', 'number', 'handlePaymentInput')}
+                        
+                        <div class="space-y-1">
+                            <label class="text-xs font-bold text-gray-500 block mr-1">روش پرداخت</label>
+                            <div class="relative">
+                                <select onchange="handlePaymentInput('method', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-green-500 outline-none">
+                                    ${PAYMENT_METHODS.map(m => `<option value="${m.id}" ${state.paymentForm.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
+                                </select>
+                                <i data-lucide="credit-card" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                            </div>
+                        </div>
+
+                        ${renderSimpleInput('paymentForm.reference_code', 'شماره پیگیری / چک', 'hash', 'text', 'handlePaymentInput')}
+                        ${renderSimpleInput('paymentForm.note', 'توضیحات', 'file-text', 'text', 'handlePaymentInput')}
+
+                        <div class="flex gap-3 pt-2">
+                            <button onclick="updateState({showPaymentModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100 font-medium">انصراف</button>
+                            <button onclick="submitPayment()" class="flex-1 py-3 rounded-xl bg-green-600 text-white shadow-lg font-bold flex justify-center items-center gap-2">
+                                ${state.isSaving ? '<i data-lucide="loader-2" class="animate-spin w-5 h-5"></i>' : '<span>ثبت پرداخت</span>'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
 
         function getDemandEditModalHTML() {
             if (!state.showDemandEditModal) return '';
@@ -760,7 +846,7 @@
                             <label class="text-xs font-bold text-gray-500 block mr-1">وضعیت</label>
                             <div class="relative">
                                 <select onchange="handleDemandEditInput('status', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-yellow-500 outline-none">
-                                    ${DEMAND_STATUSES.map(s => `<option value="${s.id}" ${status === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}
+                                    ${state.statuses.map(s => `<option value="${s.code}" ${status === s.code ? 'selected' : ''}>${s.label}</option>`).join('')}
                                 </select>
                                 <i data-lucide="activity" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
                             </div>
@@ -846,10 +932,13 @@
                 const unit = getProductUnitLabel(d.product_id);
                 const date = formatDate(d.created_at);
                 
-                // Status Logic
                 const currentStatus = d.status || 'registered';
-                const currentStatusObj = DEMAND_STATUSES.find(s => s.id === currentStatus) || DEMAND_STATUSES[0];
-
+                const currentStatusObj = state.statuses.find(s => s.code === currentStatus) || state.statuses[0] || {label: currentStatus, color: 'bg-gray-100'};
+                
+                // Payment Logic
+                const totalPaid = calculateTotalPaid(d.id);
+                const totalPrice = d.price ? parseFloat(d.price) : 0;
+                
                 return `
                 <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-3">
                     <div class="flex justify-between items-start mb-2">
@@ -863,14 +952,26 @@
                             ${d.price ? `<div class="text-xs text-gray-500">${parseInt(d.price).toLocaleString()} Rls</div>` : ''}
                         </div>
                     </div>
+                    
+                    ${totalPrice > 0 ? `
+                    <div class="mb-3 text-xs flex justify-between items-center text-gray-500 bg-gray-50 p-2 rounded">
+                        <span>پرداختی: <b>${totalPaid.toLocaleString()}</b></span>
+                        <span>مانده: <b class="${(totalPrice - totalPaid) > 0 ? 'text-red-500' : 'text-green-500'}">${(totalPrice - totalPaid).toLocaleString()}</b></span>
+                    </div>` : ''}
+
                     <div class="flex gap-2 items-center">
                         <div class="flex-1">
                             <span class="block text-xs font-bold text-gray-400 mb-1">وضعیت:</span>
                             <div class="text-xs py-1 px-2 rounded-lg ${currentStatusObj.color} inline-block">${currentStatusObj.label}</div>
                         </div>
-                        <button onclick="openDemandEditModal(${cleanDemand})" class="bg-yellow-50 text-yellow-700 p-2 rounded-lg hover:bg-yellow-100 flex items-center gap-1 text-xs font-bold border border-yellow-200">
-                           <i data-lucide="edit-2" class="w-4 h-4"></i> ویرایش
-                        </button>
+                        <div class="flex gap-2">
+                            <button onclick="openPaymentModal('${d.id}')" class="bg-green-50 text-green-700 p-2 rounded-lg hover:bg-green-100 border border-green-200" title="ثبت پرداخت">
+                                <i data-lucide="banknote" class="w-4 h-4"></i>
+                            </button>
+                            <button onclick="openDemandEditModal(${cleanDemand})" class="bg-yellow-50 text-yellow-700 p-2 rounded-lg hover:bg-yellow-100 flex items-center gap-1 text-xs font-bold border border-yellow-200">
+                               <i data-lucide="edit-2" class="w-4 h-4"></i> ویرایش
+                            </button>
+                        </div>
                     </div>
                 </div>
                 `;
@@ -969,6 +1070,8 @@
 
                 <!-- EDIT DEMAND MODAL -->
                 ${getDemandEditModalHTML()}
+                <!-- PAYMENT MODAL -->
+                ${getPaymentModalHTML()}
             </div>`;
         }
 
@@ -1039,7 +1142,10 @@
             let content = '';
 
             if (activeTab === 'leads') {
-                const leadsTable = state.leads.filter(l => state.managerFilter === 'all' || l.activity_type_id === state.managerFilter).map(lead => {
+                const filteredLeads = state.leads.filter(l => state.managerFilter === 'all' || l.activity_type_id === state.managerFilter);
+                
+                // Desktop Table
+                const leadsTableRows = filteredLeads.map(lead => {
                     const cleanLead = JSON.stringify(lead).replace(/"/g, '&quot;');
                     const categoryName = getCategoryName(lead.business_category_id);
                     const activityName = getActivityName(lead.activity_type_id);
@@ -1063,49 +1169,122 @@
                     </tr>
                 `}).join('');
 
+                // Mobile Cards (New)
+                const leadsMobileCards = filteredLeads.map(lead => {
+                    const cleanLead = JSON.stringify(lead).replace(/"/g, '&quot;');
+                    const categoryName = getCategoryName(lead.business_category_id);
+                    const activityName = getActivityName(lead.activity_type_id);
+                    const visitorDisplay = getVisitorName(lead.visitor_id, lead.visitor_name);
+                    const cityName = CITIES.find(c => c.id === lead.city)?.label || lead.city;
+
+                    return `
+                    <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 relative">
+                        <div class="flex justify-between items-start mb-2">
+                            <div>
+                                <h3 class="font-bold text-gray-800 text-lg">${lead.business_name}</h3>
+                                <div class="text-xs text-gray-500 mt-0.5">${categoryName}</div>
+                            </div>
+                            <span class="bg-blue-50 text-blue-700 px-2 py-1 rounded-lg text-xs whitespace-nowrap">${activityName}</span>
+                        </div>
+                        <div class="text-sm text-gray-600 mb-1 flex items-center gap-2"><i data-lucide="user" class="w-3 h-3"></i> ${lead.contact_name || '---'}</div>
+                        <div class="text-xs text-gray-400 mb-3 flex items-center gap-2">
+                            <span><i data-lucide="map-pin" class="w-3 h-3 inline"></i> ${cityName}</span>
+                            <span>|</span>
+                            <span><i data-lucide="briefcase" class="w-3 h-3 inline"></i> ${visitorDisplay}</span>
+                        </div>
+                        <div class="flex justify-end gap-2 border-t border-gray-50 pt-2 mt-2">
+                            <button onclick="openLeadModal(${cleanLead})" class="text-blue-600 bg-blue-50 px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1"><i data-lucide="edit-2" class="w-3 h-3"></i> ویرایش</button>
+                            <button onclick="deleteLead('${lead.id}')" class="text-red-600 bg-red-50 px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1"><i data-lucide="trash-2" class="w-3 h-3"></i> حذف</button>
+                        </div>
+                    </div>
+                    `;
+                }).join('');
+
                 content = `
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                         <div class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100"><div class="text-gray-500 text-xs">کل لیدها</div><div class="text-2xl font-bold text-gray-800">${state.leads.length}</div></div>
                     </div>
                     <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-                        <div class="p-4 border-b flex justify-between items-center">
+                        <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
                             <div class="flex gap-2 items-center">
-                                <h2 class="font-bold">مشتریان</h2>
+                                <h2 class="font-bold text-gray-800">مشتریان</h2>
                                 <button onclick="openLeadModal()" class="bg-purple-50 text-purple-700 p-1.5 rounded-lg hover:bg-purple-100"><i data-lucide="plus" class="w-4 h-4"></i></button>
                             </div>
-                            <select onchange="updateState({managerFilter: this.value})" class="bg-gray-50 border rounded-lg px-2 py-1 text-sm"><option value="all">همه</option>${state.activityTypes.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
+                            <select onchange="updateState({managerFilter: this.value})" class="bg-white border rounded-lg px-2 py-1 text-sm outline-none"><option value="all">همه</option>${state.activityTypes.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
                         </div>
-                        <div class="overflow-x-auto"><table class="w-full text-right text-sm"><thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">کسب‌وکار</th><th class="px-4 py-3 hidden md:table-cell">مخاطب</th><th class="px-4 py-3">فعالیت</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">عملیات</th></tr></thead><tbody>${leadsTable}</tbody></table></div>
+                        
+                        <!-- Desktop View -->
+                        <div class="hidden md:block overflow-x-auto">
+                            <table class="w-full text-right text-sm">
+                                <thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">کسب‌وکار</th><th class="px-4 py-3 hidden md:table-cell">مخاطب</th><th class="px-4 py-3">فعالیت</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">عملیات</th></tr></thead>
+                                <tbody>${leadsTableRows}</tbody>
+                            </table>
+                        </div>
+
+                        <!-- Mobile View -->
+                        <div class="md:hidden p-4 space-y-3 bg-gray-50">
+                            ${leadsMobileCards}
+                        </div>
                     </div>
                 `;
             } else if (activeTab === 'demands') {
-                 const demandsList = state.demands.map(d => {
+                 // Common Data Prep
+                 const demandsData = state.demands.map(d => {
                     const cleanDemand = JSON.stringify(d).replace(/"/g, '&quot;');
                     const leadName = getLeadName(d.lead_id);
                     const productName = getProductName(d.product_id);
                     const unit = getProductUnitLabel(d.product_id);
                     const date = formatDate(d.created_at);
                     const visitorDisplay = getVisitorName(d.visitor_id, d.visitor_name);
-                    
                     const currentStatus = d.status || 'registered';
-                    const currentStatusObj = DEMAND_STATUSES.find(s => s.id === currentStatus) || DEMAND_STATUSES[0];
-                    
-                    return `
+                    const currentStatusObj = state.statuses.find(s => s.code === currentStatus) || state.statuses[0] || {label: currentStatus, color: 'bg-gray-100'};
+                    return { ...d, cleanDemand, leadName, productName, unit, date, visitorDisplay, currentStatusObj };
+                 });
+
+                 // Desktop Table Rows
+                 const demandsTableRows = demandsData.map(d => `
                     <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0 align-middle">
-                        <td class="px-4 py-3 font-bold text-gray-800">${leadName}</td>
-                        <td class="px-4 py-3 text-gray-700">${productName}</td>
-                        <td class="px-4 py-3 font-medium text-blue-700">${d.quantity} <span class="text-xs text-gray-500">${unit}</span></td>
+                        <td class="px-4 py-3 font-bold text-gray-800">${d.leadName}</td>
+                        <td class="px-4 py-3 text-gray-700">${d.productName}</td>
+                        <td class="px-4 py-3 font-medium text-blue-700">${d.quantity} <span class="text-xs text-gray-500">${d.unit}</span></td>
                         <td class="px-4 py-3 text-sm text-gray-600">${d.price ? parseInt(d.price).toLocaleString() : '-'}</td>
-                        <td class="px-4 py-3 text-sm text-gray-500">${visitorDisplay || '-'}</td>
-                        <td class="px-4 py-3 text-sm text-gray-400 dir-ltr text-right">${date}</td>
+                        <td class="px-4 py-3 text-sm text-gray-500">${d.visitorDisplay || '-'}</td>
+                        <td class="px-4 py-3 text-sm text-gray-400 dir-ltr text-right">${d.date}</td>
                         <td class="px-4 py-3 text-sm">
                              <div class="flex items-center gap-2">
-                                <div class="text-xs py-1 px-2 rounded-lg ${currentStatusObj.color}">${currentStatusObj.label}</div>
-                                <button onclick="openDemandEditModal(${cleanDemand})" class="text-gray-400 hover:text-blue-600 p-1"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                                <div class="text-xs py-1 px-2 rounded-lg whitespace-nowrap ${d.currentStatusObj.color}">${d.currentStatusObj.label}</div>
+                                <button onclick="openPaymentModal('${d.id}')" class="text-green-500 hover:text-green-700 p-1" title="ثبت پرداخت"><i data-lucide="banknote" class="w-4 h-4"></i></button>
+                                <button onclick="openDemandEditModal(${d.cleanDemand})" class="text-gray-400 hover:text-blue-600 p-1"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
                              </div>
                         </td>
-                    </tr>`;
-                }).join('');
+                    </tr>`).join('');
+
+                // Mobile Cards
+                const demandsMobileCards = demandsData.map(d => `
+                    <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 relative">
+                        <div class="flex justify-between items-start mb-2">
+                            <span class="font-bold text-gray-800 text-lg">${d.leadName}</span>
+                            <span class="text-xs text-gray-400 dir-ltr">${d.date}</span>
+                        </div>
+                        <div class="flex justify-between items-center bg-gray-50 p-2 rounded-lg mb-3">
+                            <span class="text-sm text-gray-700">${d.productName}</span>
+                            <div class="text-right">
+                                <div class="font-bold text-blue-700">${d.quantity} <span class="text-xs text-gray-500 font-normal">${d.unit}</span></div>
+                                ${d.price ? `<div class="text-xs text-gray-500">${parseInt(d.price).toLocaleString()} Rls</div>` : ''}
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between mt-2">
+                            <div class="flex flex-col">
+                                <span class="text-[10px] text-gray-400">ویزیتور: ${d.visitorDisplay}</span>
+                                <div class="text-xs py-1 px-2 rounded-lg ${d.currentStatusObj.color} mt-1 self-start">${d.currentStatusObj.label}</div>
+                            </div>
+                            <div class="flex gap-2">
+                                <button onclick="openPaymentModal('${d.id}')" class="bg-green-50 text-green-700 p-2 rounded-lg border border-green-100"><i data-lucide="banknote" class="w-4 h-4"></i></button>
+                                <button onclick="openDemandEditModal(${d.cleanDemand})" class="bg-gray-50 text-gray-600 p-2 rounded-lg border border-gray-200"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
 
                 content = `
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
@@ -1115,13 +1294,20 @@
                          <div class="p-4 border-b bg-gray-50/50">
                             <h2 class="font-bold text-gray-800 flex items-center gap-2"><i data-lucide="shopping-bag" class="w-4 h-4 text-green-600"></i> سفارشات ثبت شده</h2>
                         </div>
-                        <div class="overflow-x-auto">
+                        
+                        <!-- Desktop View -->
+                        <div class="hidden md:block overflow-x-auto">
                             <table class="w-full text-right text-sm">
                                 <thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">مشتری</th><th class="px-4 py-3">کالا</th><th class="px-4 py-3">تعداد</th><th class="px-4 py-3">قیمت</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">تاریخ</th><th class="px-4 py-3">وضعیت</th></tr></thead>
                                 <tbody>
-                                    ${demandsList.length ? demandsList : '<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">هنوز سفارشی ثبت نشده است</td></tr>'}
+                                    ${demandsTableRows.length ? demandsTableRows : '<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">هنوز سفارشی ثبت نشده است</td></tr>'}
                                 </tbody>
                             </table>
+                        </div>
+
+                        <!-- Mobile View -->
+                        <div class="md:hidden p-4 space-y-3 bg-gray-50">
+                             ${demandsMobileCards.length ? demandsMobileCards : '<div class="text-center text-gray-400 py-8">هنوز سفارشی ثبت نشده است</div>'}
                         </div>
                     </div>
                 `;
@@ -1174,13 +1360,35 @@
                     </tr>`;
                 }).join('');
 
+                const productsMobileCards = state.products.map(prod => {
+                    const cleanProd = JSON.stringify(prod).replace(/"/g, '&quot;');
+                    const catName = getCategoryName(prod.business_category_id);
+                    const unitLabel = PRODUCT_UNITS.find(u => u.id === prod.unit)?.label.split(' ')[0] || prod.unit;
+
+                    return `
+                    <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center">
+                        <div>
+                            <div class="font-bold text-gray-900">${prod.name}</div>
+                            <div class="text-xs text-gray-500 mt-0.5">${catName} | ${unitLabel}</div>
+                            ${prod.preffered_price ? `<div class="text-sm font-mono text-gray-700 mt-1">${parseInt(prod.preffered_price).toLocaleString()} Rls</div>` : ''}
+                        </div>
+                        <div class="flex gap-2">
+                            <button onclick="openProductModal(${cleanProd})" class="bg-blue-50 text-blue-600 p-2 rounded-lg"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                            <button onclick="deleteProduct('${prod.id}')" class="bg-red-50 text-red-600 p-2 rounded-lg"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>
+                    `;
+                }).join('');
+
                 content = `
                     <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
                         <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
                             <h2 class="font-bold text-gray-800">محصولات</h2>
                             <button onclick="openProductModal()" class="bg-indigo-600 text-white px-3 py-1.5 rounded-lg text-xs flex gap-1 hover:bg-indigo-700 shadow-lg shadow-indigo-100"><i data-lucide="plus" class="w-3 h-3"></i> افزودن کالا</button>
                         </div>
-                        <div class="overflow-x-auto">
+                        
+                        <!-- Desktop View -->
+                        <div class="hidden md:block overflow-x-auto">
                             <table class="w-full text-right text-sm">
                                 <thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">نام کالا</th><th class="px-4 py-3">واحد</th><th class="px-4 py-3">قیمت (ریال)</th><th class="px-4 py-3">عملیات</th></tr></thead>
                                 <tbody>
@@ -1188,14 +1396,20 @@
                                 </tbody>
                             </table>
                         </div>
+
+                        <!-- Mobile View -->
+                        <div class="md:hidden p-4 space-y-3 bg-gray-50">
+                            ${productsMobileCards.length ? productsMobileCards : '<div class="text-center text-gray-400 py-8">هیچ محصولی یافت نشد</div>'}
+                        </div>
                     </div>
                 `;
 
             } else if (activeTab === 'settings') {
+                // CATEGORIES LIST
                 const categoriesList = state.categories.map(cat => {
                     const cleanName = cat.name.replace(/'/g, "\\'");
                     return `
-                    <div class="flex items-center justify-between p-3 border-b border-gray-50 hover:bg-gray-50">
+                    <div class="flex items-center justify-between p-3 border-b border-gray-50 hover:bg-gray-50 last:border-0">
                         <span class="text-sm font-medium text-gray-700">${cat.name}</span>
                         <div class="flex gap-2">
                             <button onclick="openCategoryModal({id: '${cat.id}', name: '${cleanName}'})" class="p-1.5 text-blue-600 bg-blue-50 rounded"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
@@ -1203,13 +1417,42 @@
                         </div>
                     </div>
                 `}).join('');
-                content = `
-                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-                        <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
-                            <h2 class="font-bold text-gray-800">دسته‌بندی‌ها</h2>
-                            <button onclick="openCategoryModal()" class="bg-white border text-gray-700 px-3 py-1.5 rounded-lg text-xs flex gap-1 hover:bg-gray-50"><i data-lucide="plus" class="w-3 h-3"></i> افزودن</button>
+
+                // STATUSES LIST (NEW)
+                const statusesList = state.statuses.map(status => {
+                    const cleanStatus = JSON.stringify(status).replace(/"/g, '&quot;');
+                    return `
+                    <div class="flex items-center justify-between p-3 border-b border-gray-50 hover:bg-gray-50 last:border-0">
+                        <div class="flex items-center gap-3">
+                            <div class="text-xs px-2 py-1 rounded ${status.color}">${status.label}</div>
+                            <span class="text-xs text-gray-400 font-mono">${status.code}</span>
                         </div>
-                        <div class="divide-y divide-gray-100">${categoriesList}</div>
+                        <div class="flex gap-2">
+                            <button onclick="openStatusModal(${cleanStatus})" class="p-1.5 text-blue-600 bg-blue-50 rounded"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                            <button onclick="deleteStatus('${status.id}')" class="p-1.5 text-red-600 bg-red-50 rounded"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>
+                `}).join('');
+
+                content = `
+                    <div class="space-y-6">
+                        <!-- CATEGORIES -->
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                            <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
+                                <h2 class="font-bold text-gray-800">دسته‌بندی‌ها</h2>
+                                <button onclick="openCategoryModal()" class="bg-white border text-gray-700 px-3 py-1.5 rounded-lg text-xs flex gap-1 hover:bg-gray-50"><i data-lucide="plus" class="w-3 h-3"></i> افزودن</button>
+                            </div>
+                            <div class="divide-y divide-gray-100">${categoriesList}</div>
+                        </div>
+
+                        <!-- STATUSES (NEW) -->
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                            <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
+                                <h2 class="font-bold text-gray-800">وضعیت‌های سفارش</h2>
+                                <button onclick="openStatusModal()" class="bg-white border text-gray-700 px-3 py-1.5 rounded-lg text-xs flex gap-1 hover:bg-gray-50"><i data-lucide="plus" class="w-3 h-3"></i> افزودن</button>
+                            </div>
+                            <div class="divide-y divide-gray-100">${statusesList}</div>
+                        </div>
                     </div>
                 `;
             }
@@ -1227,7 +1470,7 @@
                     <button onclick="updateState({managerTab: 'products'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'products' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="package" class="w-4 h-4"></i> محصولات</button>
                     <button onclick="updateState({managerTab: 'settings'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'settings' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="settings" class="w-4 h-4"></i> تنظیمات</button>
                 </div></div>
-                <div class="flex-1 p-6 w-full max-w-4xl mx-auto overflow-y-auto">${content}</div>
+                <div class="flex-1 p-6 w-full max-w-4xl mx-auto overflow-y-auto pb-20">${content}</div>
 
                 <!-- MODALS -->
                 ${state.showVisitorModal ? `
@@ -1300,8 +1543,35 @@
                         </div>
                     </div>` : ''}
 
+                ${state.showStatusModal ? `
+                    <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 page-enter">
+                        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden modal-enter">
+                            <div class="p-4 border-b bg-gray-50 flex justify-between items-center"><h3 class="font-bold text-gray-800">مدیریت وضعیت</h3><button onclick="updateState({showStatusModal: false})" class="text-gray-400"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+                            <div class="p-5 space-y-3">
+                                ${renderSimpleInput('statusForm.label', 'عنوان وضعیت (فارسی)', 'type', 'text', 'handleStatusInput')}
+                                ${renderSimpleInput('statusForm.code', 'کد سیستمی (انگلیسی)', 'code', 'text', 'handleStatusInput')}
+                                
+                                <div class="space-y-1">
+                                    <label class="text-xs font-bold text-gray-500 block mr-1">رنگ ظاهری</label>
+                                    <div class="relative">
+                                        <select onchange="handleStatusInput('color', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
+                                            ${STATUS_COLOR_PRESETS.map(c => `<option value="${c.id}" ${state.statusForm.color === c.id ? 'selected' : ''}>${c.label}</option>`).join('')}
+                                        </select>
+                                        <i data-lucide="palette" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                                    </div>
+                                </div>
+
+                                ${renderSimpleInput('statusForm.sort_order', 'ترتیب نمایش (عدد)', 'list', 'number', 'handleStatusInput')}
+
+                                <div class="flex gap-3 pt-2"><button onclick="updateState({showStatusModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100">انصراف</button><button onclick="saveStatus()" class="flex-1 py-3 rounded-xl bg-blue-600 text-white">ذخیره</button></div>
+                            </div>
+                        </div>
+                    </div>` : ''}
+
                 <!-- EDIT DEMAND MODAL -->
                 ${getDemandEditModalHTML()}
+                <!-- PAYMENT MODAL -->
+                ${getPaymentModalHTML()}
             </div>`;
         }
 
@@ -1326,6 +1596,7 @@
 
         window.handleVisitorInput = function(key, value) { state.visitorForm[key] = value; }
         window.handleCategoryInput = function(key, value) { state.categoryForm[key] = value; }
+        window.handleStatusInput = function(key, value) { state.statusForm[key] = value; }
         window.handleLoginInput = function(key, value) { state.loginForm[key] = value; document.getElementById('login-btn').disabled = !(state.loginForm.username && state.loginForm.password); }
         window.handleManagerLeadInput = function(key, value) { state.leadForm[key] = value; }
         window.handleProductInput = function(key, value) { state.productForm[key] = value; }
@@ -1342,6 +1613,11 @@
         window.handleDemandEditInput = handleDemandEditInput;
         window.saveDemandEdit = saveDemandEdit;
 
+        // Payment Exports
+        window.openPaymentModal = openPaymentModal;
+        window.handlePaymentInput = handlePaymentInput;
+        window.submitPayment = submitPayment;
+
         window.openVisitorModal = openVisitorModal;
         window.saveVisitor = saveVisitor;
         window.deleteVisitor = deleteVisitor;
@@ -1357,6 +1633,10 @@
         window.openCategoryModal = openCategoryModal;
         window.saveCategory = saveCategory;
         window.deleteCategory = deleteCategory;
+
+        window.openStatusModal = openStatusModal;
+        window.saveStatus = saveStatus;
+        window.deleteStatus = deleteStatus;
 
         function showToast(message, type) {
             const toast = document.getElementById('toast');
