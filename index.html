@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Wholesale Visitor App</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Font: Vazirmatn -->
+    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+    <!-- Supabase JS Client -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    
+    <style>
+        body { font-family: 'Vazirmatn', sans-serif; }
+        .page-enter { animation: fadeScale 0.2s ease-out; }
+        @keyframes fadeScale {
+            from { opacity: 0; transform: scale(0.98); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .modal-enter { animation: modalUp 0.3s ease-out; }
+        @keyframes modalUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 text-gray-900 h-screen overflow-hidden relative select-none touch-manipulation">
+
+    <div id="app" class="h-full w-full flex flex-col mx-auto bg-gray-50 shadow-2xl relative"></div>
+
+    <div id="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-[100] px-6 py-3 rounded-xl shadow-xl flex items-center gap-3 transition-all duration-300 transform -translate-y-24 opacity-0 pointer-events-none bg-gray-800 text-white w-max max-w-[90%]">
+        <div id="toast-icon"></div>
+        <span id="toast-message" class="text-sm font-medium"></span>
+    </div>
+
+    <script>
+        // ==========================================
+        //  🚨 SUPABASE CONFIG 🚨
+        // ==========================================
+        
+        const SUPABASE_URL = 'https://vwfwkabpuqycfbizbblt.supabase.co'; 
+        const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ3ZndrYWJwdXF5Y2ZiaXpiYmx0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ4NDQ4MzQsImV4cCI6MjA4MDQyMDgzNH0.6O0nh1pF4cT0JmNNwKs8FprMvKe6VJv8TqWA7IEfSn0';
+
+        let supabase;
+        try {
+            supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+        } catch (e) {
+            console.error("Supabase init failed.");
+        }
+
+        // --- CONSTANTS ---
+        const SECTORS = [
+            { id: 'retail', label: 'خرده‌فروش (Retail)' },
+            { id: 'wholesale', label: 'عمده‌فروش (Wholesale)' },
+            { id: 'distribution', label: 'پخش (Distribution)' },
+            { id: 'horeca', label: 'هتل/رستوران (Horeca)' }
+        ];
+
+        const CITIES = [
+            { id: 'ahvaz', label: 'اهواز' },
+            { id: 'tehran', label: 'تهران' },
+            { id: 'mashhad', label: 'مشهد' },
+            { id: 'isfahan', label: 'اصفهان' },
+            { id: 'shiraz', label: 'شیراز' },
+            { id: 'other', label: 'سایر' }
+        ];
+
+        // --- STATE ---
+        let state = {
+            view: 'login', 
+            currentUser: null,
+            leads: [],
+            users: [],
+            categories: [], 
+            
+            // Login
+            loginForm: { username: '', password: '' },
+            loginError: '',
+            isLoggingIn: false,
+            
+            // Manager General
+            managerTab: 'leads', // leads, visitors, settings
+            managerFilter: 'all',
+
+            // Manager: Visitor CRUD
+            showVisitorModal: false,
+            visitorForm: { id: null, name: '', mobile: '', password: '', region: '' },
+
+            // Manager: Lead CRUD
+            showLeadModal: false,
+            leadForm: { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type: 'retail', business_category_id: '' },
+
+            // Settings (Categories CRUD)
+            showCategoryModal: false,
+            categoryForm: { id: null, name: '' },
+
+            // Visitor App Form
+            form: {
+                city: 'ahvaz',
+                business_name: '',
+                contact_name: '',
+                phone: '',
+                activity_type: 'retail',
+                business_category_id: '' 
+            },
+            isSaving: false,
+            isLoadingData: false
+        };
+
+        // --- CORE FUNCTIONS ---
+
+        function updateState(updates) {
+            state = { ...state, ...updates };
+            render();
+        }
+
+        // Initialize App & Check for Persistent Login
+        async function initApp() {
+            const savedUser = localStorage.getItem('visitorAppUser');
+            if (savedUser) {
+                try {
+                    const user = JSON.parse(savedUser);
+                    updateState({ currentUser: user });
+                    await loadAppData(user.role);
+                    updateState({ view: user.role === 'visitor' ? 'visitor-home' : 'manager-dash' });
+                    showToast(`بازگشت مجدد: ${user.name}`, 'success');
+                } catch (e) {
+                    localStorage.removeItem('visitorAppUser');
+                }
+            }
+        }
+
+        async function attemptLogin() {
+            if(!supabase) return showToast('تنظیمات Supabase انجام نشده است', 'error');
+
+            const { username, password } = state.loginForm;
+            updateState({ isLoggingIn: true, loginError: '' });
+
+            const { data, error } = await supabase
+                .from('users')
+                .select('*')
+                .eq('username', username)
+                .eq('password', password)
+                .single();
+
+            if (error || !data) {
+                 updateState({ isLoggingIn: false, loginError: 'نام کاربری یا رمز عبور اشتباه است' });
+            } else {
+                state.currentUser = data;
+                state.loginForm = { username: '', password: '' };
+                localStorage.setItem('visitorAppUser', JSON.stringify(data));
+                await loadAppData(data.role);
+                updateState({ 
+                    isLoggingIn: false, 
+                    view: data.role === 'visitor' ? 'visitor-home' : 'manager-dash' 
+                });
+                showToast(`خوش آمدید، ${data.name}`, 'success');
+            }
+        }
+
+        async function loadAppData() {
+            if (!state.currentUser) return;
+            updateState({ isLoadingData: true });
+            
+            const { data: catData } = await supabase.from('business_categories').select('*').order('name');
+            if (catData) state.categories = catData;
+
+            const { data: leadsData } = await supabase.from('leads').select('*').order('created_at', { ascending: false });
+            state.leads = leadsData || [];
+
+            if (state.currentUser.role === 'manager') {
+                const { data: usersData } = await supabase.from('users').select('*').eq('role', 'visitor');
+                state.users = usersData || [];
+            }
+            
+            updateState({ isLoadingData: false });
+        }
+
+        function handleLogout() {
+            localStorage.removeItem('visitorAppUser');
+            updateState({ currentUser: null, view: 'login', leads: [], users: [] });
+        }
+
+        // --- VISITOR APP ACTIONS ---
+
+        function goToAddLead() {
+            const defaultCat = state.categories.length > 0 ? state.categories[0].id : '';
+            updateState({ 
+                view: 'visitor-add',
+                form: { city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type: 'retail', business_category_id: defaultCat }
+            });
+        }
+
+        function handleLeadInput(key, value) {
+            state.form[key] = value;
+            const btn = document.getElementById('submit-lead-btn');
+            const helper = document.getElementById('lead-helper-text');
+            const isValid = state.form.business_name && state.form.phone;
+            if(btn) btn.disabled = !isValid;
+            if(helper) helper.style.display = isValid ? 'none' : 'block';
+        }
+        
+        function handleLoginInput(key, value) {
+            state.loginForm[key] = value;
+            const btn = document.getElementById('login-btn');
+            if(btn) btn.disabled = !(state.loginForm.username && state.loginForm.password);
+        }
+
+        async function submitLead() {
+            updateState({ isSaving: true });
+            const newLead = {
+                business_name: state.form.business_name,
+                contact_name: state.form.contact_name,
+                phone: state.form.phone,
+                activity_type: state.form.activity_type,
+                city: state.form.city,
+                user_name: state.currentUser.name,
+                business_category_id: state.form.business_category_id || null
+            };
+
+            const { data, error } = await supabase.from('leads').insert([newLead]).select();
+
+            if (error) {
+                showToast('خطا در ذخیره اطلاعات', 'error');
+                updateState({ isSaving: false });
+            } else {
+                state.leads = [data[0], ...state.leads];
+                updateState({ isSaving: false, view: 'visitor-home' });
+                showToast('اطلاعات با موفقیت ذخیره شد', 'success');
+            }
+        }
+
+        // --- MANAGER: VISITOR CRUD ---
+
+        function openVisitorModal(visitor = null) {
+            updateState({
+                showVisitorModal: true,
+                visitorForm: visitor 
+                    ? { id: visitor.id, name: visitor.name, mobile: visitor.username, password: visitor.password, region: visitor.region }
+                    : { id: null, name: '', mobile: '', password: '', region: '' }
+            });
+        }
+
+        async function saveVisitor() {
+            const { id, name, mobile, password, region } = state.visitorForm;
+            if (!name || !mobile) return;
+
+            const userData = {
+                name,
+                username: mobile, // Mobile is username
+                role: 'visitor',
+                region: region || 'نامشخص'
+            };
+            if (password) userData.password = password; // Only update password if provided during edit
+
+            let result;
+            if (id) {
+                // Update
+                result = await supabase.from('users').update(userData).eq('id', id).select();
+            } else {
+                // Insert
+                if (!password) return showToast('رمز عبور الزامی است', 'error');
+                userData.password = password;
+                result = await supabase.from('users').insert([userData]).select();
+            }
+
+            const { data, error } = result;
+
+            if (error) {
+                showToast('خطا: ' + error.message, 'error');
+            } else {
+                if (id) {
+                    state.users = state.users.map(u => u.id === id ? data[0] : u);
+                } else {
+                    state.users = [...state.users, data[0]];
+                }
+                updateState({ showVisitorModal: false });
+                showToast(id ? 'ویزیتور ویرایش شد' : 'ویزیتور جدید ایجاد شد', 'success');
+            }
+        }
+
+        async function deleteVisitor(id) {
+            if (!confirm('آیا از حذف این حساب کاربری اطمینان دارید؟')) return;
+            
+            const { error } = await supabase.from('users').delete().eq('id', id);
+            
+            if (error) {
+                showToast('خطا در حذف کاربر', 'error');
+            } else {
+                state.users = state.users.filter(u => u.id !== id);
+                render();
+                showToast('حساب کاربری حذف شد', 'success');
+            }
+        }
+
+        // --- MANAGER: LEAD CRUD ---
+
+        function openLeadModal(lead = null) {
+            const defaultCat = state.categories.length > 0 ? state.categories[0].id : '';
+            updateState({
+                showLeadModal: true,
+                leadForm: lead 
+                    ? { ...lead } 
+                    : { id: null, city: 'ahvaz', business_name: '', contact_name: '', phone: '', activity_type: 'retail', business_category_id: defaultCat, user_name: state.currentUser.name }
+            });
+        }
+
+        async function saveManagerLead() {
+            const formData = state.leadForm;
+            if (!formData.business_name || !formData.phone) return;
+
+            // Prepare payload (remove id if null for insert, keep for reference logic)
+            const payload = {
+                business_name: formData.business_name,
+                contact_name: formData.contact_name,
+                phone: formData.phone,
+                activity_type: formData.activity_type,
+                city: formData.city,
+                business_category_id: formData.business_category_id || null,
+                user_name: formData.user_name || state.currentUser.name
+            };
+
+            let result;
+            if (formData.id) {
+                // Update
+                result = await supabase.from('leads').update(payload).eq('id', formData.id).select();
+            } else {
+                // Insert
+                result = await supabase.from('leads').insert([payload]).select();
+            }
+
+            const { data, error } = result;
+
+            if (error) {
+                showToast('خطا در ذخیره لید', 'error');
+            } else {
+                if (formData.id) {
+                    state.leads = state.leads.map(l => l.id === formData.id ? data[0] : l);
+                } else {
+                    state.leads = [data[0], ...state.leads];
+                }
+                updateState({ showLeadModal: false });
+                showToast(formData.id ? 'لید ویرایش شد' : 'لید جدید ثبت شد', 'success');
+            }
+        }
+
+        async function deleteLead(id) {
+            if (!confirm('آیا از حذف این رکورد اطمینان دارید؟')) return;
+
+            const { error } = await supabase.from('leads').delete().eq('id', id);
+
+            if (error) {
+                showToast('خطا در حذف رکورد', 'error');
+            } else {
+                state.leads = state.leads.filter(l => l.id !== id);
+                render();
+                showToast('رکورد حذف شد', 'success');
+            }
+        }
+
+        // --- MANAGER: SETTINGS (CATEGORIES) ---
+
+        function openCategoryModal(category = null) {
+            updateState({
+                showCategoryModal: true,
+                categoryForm: category ? { ...category } : { id: null, name: '' }
+            });
+        }
+
+        async function saveCategory() {
+            const { id, name } = state.categoryForm;
+            if (!name.trim()) return;
+
+            let result;
+            if (id) {
+                result = await supabase.from('business_categories').update({ name }).eq('id', id).select();
+            } else {
+                result = await supabase.from('business_categories').insert({ name }).select();
+            }
+
+            const { data, error } = result;
+
+            if (error) {
+                showToast('خطا در ذخیره', 'error');
+            } else {
+                if (id) {
+                    state.categories = state.categories.map(c => c.id === id ? data[0] : c);
+                } else {
+                    state.categories = [...state.categories, data[0]];
+                }
+                updateState({ showCategoryModal: false });
+                showToast('دسته&zwnj;بندی ذخیره شد', 'success');
+            }
+        }
+
+        async function deleteCategory(id) {
+            if (!confirm('آیا اطمینان دارید؟')) return;
+            const { error } = await supabase.from('business_categories').delete().eq('id', id);
+            if (error) {
+                showToast('خطا (شاید استفاده شده باشد)', 'error');
+            } else {
+                state.categories = state.categories.filter(c => c.id !== id);
+                render();
+                showToast('حذف شد', 'success');
+            }
+        }
+
+        // --- RENDER ENGINE ---
+
+        function render() {
+            const app = document.getElementById('app');
+            let html = '';
+
+            switch (state.view) {
+                case 'login': html = getLoginHTML(); break;
+                case 'visitor-home': html = getVisitorHomeHTML(); break;
+                case 'visitor-add': html = getVisitorAddHTML(); break;
+                case 'manager-dash': html = getManagerDashHTML(); break;
+            }
+
+            app.innerHTML = html;
+            if (window.lucide) lucide.createIcons();
+        }
+
+        function getCategoryName(id) {
+            if (!id) return '';
+            const cat = state.categories.find(c => c.id === id);
+            return cat ? cat.name : '';
+        }
+
+        // --- TEMPLATES ---
+
+        function getLoginHTML() {
+            return `
+            <div class="flex flex-col items-center justify-center min-h-screen bg-slate-50 p-6 page-enter">
+                <div class="w-full max-w-sm bg-white rounded-3xl shadow-xl overflow-hidden">
+                    <div class="bg-blue-600 p-8 text-center relative overflow-hidden">
+                         <div class="absolute -top-10 -right-10 w-32 h-32 bg-blue-500 rounded-full opacity-50 blur-xl"></div>
+                        <div class="relative z-10">
+                            <i data-lucide="database" class="w-10 h-10 text-white mx-auto mb-2"></i>
+                            <h1 class="text-2xl font-bold text-white">Visitor MVP</h1>
+                            <p class="text-blue-100 text-sm">سیستم یکپارچه فروش</p>
+                        </div>
+                    </div>
+                    <div class="p-8 space-y-5">
+                        <div class="space-y-4">
+                            ${renderSimpleInput('loginForm.username', 'نام کاربری (موبایل)', 'user', 'tel', 'handleLoginInput')}
+                            ${renderSimpleInput('loginForm.password', 'رمز عبور', 'key', 'password', 'handleLoginInput')}
+                        </div>
+                        ${state.loginError ? `<div class="text-red-500 text-xs text-center bg-red-50 py-2 rounded-lg">${state.loginError}</div>` : ''}
+                        <button id="login-btn" onclick="attemptLogin()" disabled class="w-full py-4 rounded-xl font-bold text-lg bg-blue-600 text-white shadow-lg hover:bg-blue-700 disabled:opacity-50 transition-all flex justify-center items-center gap-2">
+                            ${state.isLoggingIn ? '<i data-lucide="loader-2" class="animate-spin"></i>' : '<span>ورود</span> <i data-lucide="arrow-left" class="w-5 h-5"></i>'}
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function getVisitorHomeHTML() {
+            const list = state.leads.map(lead => {
+                const categoryName = getCategoryName(lead.business_category_id);
+                return `
+                <div class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center mb-3">
+                    <div>
+                        <div class="font-bold text-gray-800">${lead.business_name}</div>
+                        <div class="text-sm text-gray-500 flex items-center gap-2 mt-1">
+                            <i data-lucide="user" class="w-3 h-3"></i> ${lead.contact_name || '---'}
+                        </div>
+                        <div class="text-xs text-gray-400 mt-2 flex items-center gap-2">
+                             <span class="flex items-center gap-1"><i data-lucide="map-pin" class="w-3 h-3"></i> ${CITIES.find(c => c.id === lead.city)?.label || lead.city}</span>
+                             ${categoryName ? `<span class="flex items-center gap-1 bg-gray-100 px-2 py-0.5 rounded text-gray-600"><i data-lucide="tag" class="w-3 h-3"></i> ${categoryName}</span>` : ''}
+                        </div>
+                    </div>
+                    <span class="text-xs bg-blue-50 text-blue-700 px-3 py-1 rounded-lg">
+                        ${SECTORS.find(t => t.id === lead.activity_type)?.label.split(' ')[0] || '---'}
+                    </span>
+                </div>
+            `}).join('');
+
+            return `
+            <div class="h-full flex flex-col bg-slate-100 page-enter">
+                <header class="bg-blue-800 text-white p-6 rounded-b-[2.5rem] shadow-lg mb-4 shrink-0">
+                   <div class="flex justify-between items-center mb-6">
+                      <div class="flex items-center gap-3">
+                         <div class="w-12 h-12 rounded-full bg-blue-600 flex items-center justify-center border-2 border-blue-400 shadow-md"><i data-lucide="user" class="w-6 h-6"></i></div>
+                         <div><h1 class="font-bold text-lg">${state.currentUser.name}</h1><div class="text-blue-200 text-xs">${state.currentUser.role}</div></div>
+                      </div>
+                      <button onclick="handleLogout()" class="p-2 bg-blue-600 rounded-full"><i data-lucide="log-out" class="w-4 h-4"></i></button>
+                   </div>
+                   <div class="bg-white/10 backdrop-blur-md rounded-2xl p-4 text-center"><div class="text-3xl font-bold">${state.leads.length}</div><div class="text-xs text-blue-100">کل رکوردها</div></div>
+                </header>
+                <div class="px-6 -mt-10 mb-4 flex justify-center shrink-0">
+                     <button onclick="goToAddLead()" class="bg-white text-blue-800 p-4 rounded-2xl shadow-xl flex items-center gap-3 w-full justify-center border-2 border-blue-50 active:scale-95 transition-transform"><div class="bg-blue-100 p-2 rounded-full"><i data-lucide="plus" class="w-6 h-6"></i></div><span class="font-bold text-lg">ثبت مشتری جدید</span></button>
+                </div>
+                <div class="flex-1 px-4 pb-6 overflow-y-auto no-scrollbar">${state.isLoadingData ? '<div class="text-center py-10 text-gray-400">...</div>' : list}</div>
+            </div>`;
+        }
+
+        function getVisitorAddHTML() {
+            // Re-using the same form logic as visitor-home but standalone
+            return getCommonLeadFormHTML('visitor-home', 'form', 'submitLead', 'handleLeadInput', 'submit-lead-btn', 'lead-helper-text');
+        }
+
+        // Shared Form Generator to reuse code between Visitor Add and Manager Add/Edit
+        function getCommonLeadFormHTML(backView, stateKey, submitFn, inputHandler, btnId, helperId) {
+            // stateKey e.g. 'form' (visitor) or 'leadForm' (manager)
+            const formData = state[stateKey];
+            const isManager = stateKey === 'leadForm';
+            
+            return `
+            <div class="${isManager ? '' : 'h-full flex flex-col bg-gray-50 page-enter'}">
+                ${!isManager ? `<header class="bg-white p-4 shadow-sm sticky top-0 z-10 flex items-center justify-between shrink-0">
+                    <div class="flex items-center gap-3"><button onclick="updateState({ view: '${backView}' })" class="p-2 -mr-2 text-gray-600"><i data-lucide="arrow-right" class="w-6 h-6"></i></button><h2 class="text-lg font-bold">ثبت منبع جدید</h2></div>
+                </header>` : ''}
+
+                <div class="flex-1 overflow-y-auto no-scrollbar p-5 ${isManager ? '' : 'pb-24'}">
+                  <div class="space-y-4">
+                    <div class="space-y-2">
+                        <label class="text-xs font-bold text-gray-500 block mr-1">شهر</label>
+                        <div class="relative">
+                            <select onchange="${inputHandler}('city', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
+                                ${CITIES.map(c => `<option value="${c.id}" ${formData.city === c.id ? 'selected' : ''}>${c.label}</option>`).join('')}
+                            </select>
+                            <i data-lucide="map-pin" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                        </div>
+                    </div>
+                    ${renderInput('نام مرکز پخش', `${stateKey}.business_name`, 'store', true, '', 'text', inputHandler)}
+                    ${renderInput('نام مالک', `${stateKey}.contact_name`, 'user', true, '', 'text', inputHandler)}
+                    ${renderInput('شماره موبایل', `${stateKey}.phone`, 'phone', true, '', 'tel', inputHandler)}
+                    
+                    <div class="space-y-2">
+                        <label class="text-xs font-bold text-gray-500 block mr-1">نوع فعالیت</label>
+                        <div class="relative">
+                            <select onchange="${inputHandler}('activity_type', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
+                                ${SECTORS.map(s => `<option value="${s.id}" ${formData.activity_type === s.id ? 'selected' : ''}>${s.label}</option>`).join('')}
+                            </select>
+                            <i data-lucide="briefcase" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-xs font-bold text-gray-500 block mr-1">دسته‌بندی محصولات</label>
+                        <div class="relative">
+                            <select onchange="${inputHandler}('business_category_id', this.value)" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 appearance-none focus:border-blue-500 outline-none">
+                                <option value="">انتخاب کنید...</option>
+                                ${state.categories.map(c => `<option value="${c.id}" ${formData.business_category_id === c.id ? 'selected' : ''}>${c.name}</option>`).join('')}
+                            </select>
+                            <i data-lucide="tag" class="absolute left-3 top-3.5 text-gray-400 w-5 h-5"></i>
+                        </div>
+                    </div>
+                    
+                    ${!isManager ? `<div>
+                        <p id="${helperId}" class="text-xs text-red-500 text-center mb-2 ${formData.business_name && formData.phone ? 'hidden' : ''}">نام و موبایل الزامی است.</p>
+                        <button id="${btnId}" onclick="${submitFn}()" ${(formData.business_name && formData.phone) ? '' : 'disabled'} class="w-full flex items-center justify-center gap-2 px-4 py-4 rounded-xl font-bold text-lg bg-blue-800 text-white shadow-lg disabled:opacity-50 transition-all active:scale-95">
+                            ${state.isSaving ? '<i data-lucide="loader-2" class="animate-spin"></i>' : '<i data-lucide="send"></i> ثبت اطلاعات'}
+                        </button>
+                    </div>` : ''}
+                  </div>
+                </div>
+            </div>`;
+        }
+
+        function getManagerDashHTML() {
+            const activeTab = state.managerTab; 
+            let content = '';
+
+            if (activeTab === 'leads') {
+                const leadsTable = state.leads.filter(l => state.managerFilter === 'all' || l.activity_type === state.managerFilter).map(lead => {
+                    const cleanLead = JSON.stringify(lead).replace(/"/g, '&quot;');
+                    const categoryName = getCategoryName(lead.business_category_id);
+                    return `
+                    <tr class="hover:bg-gray-50 border-b border-gray-100 last:border-0 group">
+                        <td class="px-4 py-3">
+                            <div class="font-bold text-gray-800">${lead.business_name}</div>
+                            ${categoryName ? `<div class="text-[10px] text-gray-500 bg-gray-100 inline-block px-1 rounded mt-1">${categoryName}</div>` : ''}
+                        </td>
+                        <td class="px-4 py-3 text-gray-600 hidden md:table-cell">${lead.contact_name || '-'}</td>
+                        <td class="px-4 py-3"><span class="bg-blue-50 text-blue-700 px-2 py-1 rounded text-xs">${SECTORS.find(s=>s.id===lead.activity_type)?.label.split(' ')[0] || '-'}</span></td>
+                        <td class="px-4 py-3 text-sm text-gray-500">${lead.user_name || '-'}</td>
+                        <td class="px-4 py-3">
+                            <div class="flex gap-2 opacity-100 md:opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button onclick="openLeadModal(${cleanLead})" class="p-1.5 text-blue-600 bg-blue-50 rounded hover:bg-blue-100"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                                <button onclick="deleteLead('${lead.id}')" class="p-1.5 text-red-600 bg-red-50 rounded hover:bg-red-100"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                        </td>
+                    </tr>
+                `}).join('');
+
+                content = `
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100"><div class="text-gray-500 text-xs">کل لیدها</div><div class="text-2xl font-bold text-gray-800">${state.leads.length}</div></div>
+                    </div>
+                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div class="p-4 border-b flex justify-between items-center">
+                            <div class="flex gap-2 items-center">
+                                <h2 class="font-bold">مشتریان</h2>
+                                <button onclick="openLeadModal()" class="bg-purple-50 text-purple-700 p-1.5 rounded-lg hover:bg-purple-100"><i data-lucide="plus" class="w-4 h-4"></i></button>
+                            </div>
+                            <select onchange="updateState({managerFilter: this.value})" class="bg-gray-50 border rounded-lg px-2 py-1 text-sm"><option value="all">همه</option>${SECTORS.map(s => `<option value="${s.id}">${s.label}</option>`).join('')}</select>
+                        </div>
+                        <div class="overflow-x-auto"><table class="w-full text-right text-sm"><thead class="bg-gray-50 text-gray-500"><tr><th class="px-4 py-3">کسب‌وکار</th><th class="px-4 py-3 hidden md:table-cell">مخاطب</th><th class="px-4 py-3">فعالیت</th><th class="px-4 py-3">ویزیتور</th><th class="px-4 py-3">عملیات</th></tr></thead><tbody>${leadsTable}</tbody></table></div>
+                    </div>
+                `;
+            } else if (activeTab === 'visitors') {
+                const visitorsList = state.users.map(user => {
+                    const cleanUser = JSON.stringify(user).replace(/"/g, '&quot;');
+                    return `
+                    <div class="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex items-center gap-4 group">
+                        <div class="w-10 h-10 bg-purple-100 text-purple-600 rounded-full flex items-center justify-center shrink-0"><i data-lucide="user" class="w-5 h-5"></i></div>
+                        <div class="flex-1 min-w-0">
+                            <div class="font-bold text-gray-900 truncate">${user.name}</div>
+                            <div class="text-xs text-gray-500 mt-0.5 flex items-center gap-1"><i data-lucide="phone" class="w-3 h-3"></i> ${user.username}</div>
+                            <div class="text-xs text-gray-400 mt-1 flex items-center gap-1"><i data-lucide="map-pin" class="w-3 h-3"></i> ${user.region || 'نامشخص'}</div>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <button onclick="openVisitorModal(${cleanUser})" class="text-blue-500 hover:bg-blue-50 p-1 rounded"><i data-lucide="edit-3" class="w-4 h-4"></i></button>
+                            <button onclick="deleteVisitor('${user.id}')" class="text-red-500 hover:bg-red-50 p-1 rounded"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>
+                `}).join('');
+
+                content = `
+                    <div class="flex justify-between items-center mb-4">
+                        <div><h2 class="font-bold text-lg">تیم فروش</h2></div>
+                        <button onclick="openVisitorModal()" class="bg-purple-600 text-white px-4 py-2 rounded-xl text-sm flex items-center gap-2 hover:bg-purple-700 shadow-lg shadow-purple-200"><i data-lucide="user-plus" class="w-4 h-4"></i> افزودن</button>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">${visitorsList}</div>
+                `;
+            } else if (activeTab === 'settings') {
+                const categoriesList = state.categories.map(cat => {
+                    const cleanName = cat.name.replace(/'/g, "\\'");
+                    return `
+                    <div class="flex items-center justify-between p-3 border-b border-gray-50 hover:bg-gray-50">
+                        <span class="text-sm font-medium text-gray-700">${cat.name}</span>
+                        <div class="flex gap-2">
+                            <button onclick="openCategoryModal({id: '${cat.id}', name: '${cleanName}'})" class="p-1.5 text-blue-600 bg-blue-50 rounded"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                            <button onclick="deleteCategory('${cat.id}')" class="p-1.5 text-red-600 bg-red-50 rounded"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
+                    </div>
+                `}).join('');
+                content = `
+                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div class="p-4 border-b flex justify-between items-center bg-gray-50/50">
+                            <h2 class="font-bold text-gray-800">دسته‌بندی‌ها</h2>
+                            <button onclick="openCategoryModal()" class="bg-white border text-gray-700 px-3 py-1.5 rounded-lg text-xs flex gap-1 hover:bg-gray-50"><i data-lucide="plus" class="w-3 h-3"></i> افزودن</button>
+                        </div>
+                        <div class="divide-y divide-gray-100">${categoriesList}</div>
+                    </div>
+                `;
+            }
+
+            return `
+            <div class="min-h-screen bg-gray-50 flex flex-col page-enter">
+                <nav class="bg-white shadow-sm border-b px-6 py-4 flex justify-between items-center sticky top-0 z-20">
+                    <div class="flex items-center gap-3"><div class="bg-purple-600 p-2 rounded-lg text-white"><i data-lucide="database" class="w-5 h-5"></i></div><h1 class="font-bold text-lg text-gray-800">پنل مدیریت</h1></div>
+                    <button onclick="handleLogout()" class="text-gray-500"><i data-lucide="log-out" class="w-5 h-5"></i></button>
+                </nav>
+                <div class="bg-white border-b px-6 pt-2 overflow-x-auto"><div class="flex gap-6 min-w-max">
+                    <button onclick="updateState({managerTab: 'leads'})" class="pb-3 text-sm border-b-2 transition-colors ${activeTab === 'leads' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}">گزارش‌ها</button>
+                    <button onclick="updateState({managerTab: 'visitors'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'visitors' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="users" class="w-4 h-4"></i> ویزیتورها</button>
+                    <button onclick="updateState({managerTab: 'settings'})" class="pb-3 text-sm border-b-2 transition-colors flex items-center gap-2 ${activeTab === 'settings' ? 'border-purple-600 text-purple-600 font-bold' : 'border-transparent text-gray-500'}"><i data-lucide="settings" class="w-4 h-4"></i> تنظیمات</button>
+                </div></div>
+                <div class="flex-1 p-6 w-full max-w-4xl mx-auto overflow-y-auto">${content}</div>
+
+                <!-- MODALS -->
+                ${state.showVisitorModal ? `
+                    <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 page-enter">
+                        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden modal-enter">
+                            <div class="p-4 border-b bg-purple-50 flex justify-between items-center"><h3 class="font-bold text-purple-900 flex gap-2"><i data-lucide="user-plus" class="w-5 h-5"></i> ${state.visitorForm.id ? 'ویرایش ویزیتور' : 'ثبت ویزیتور'}</h3><button onclick="updateState({showVisitorModal: false})" class="text-gray-400 hover:text-red-500"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+                            <div class="p-5 space-y-3">
+                                ${renderSimpleInput('visitorForm.name', 'نام و نام خانوادگی', 'user', 'text', 'handleVisitorInput')}
+                                ${renderSimpleInput('visitorForm.mobile', 'موبایل (نام کاربری)', 'phone', 'tel', 'handleVisitorInput')}
+                                ${renderSimpleInput('visitorForm.password', state.visitorForm.id ? 'رمز عبور (خالی=بدون تغییر)' : 'رمز عبور', 'key', 'text', 'handleVisitorInput')}
+                                ${renderSimpleInput('visitorForm.region', 'منطقه', 'map', 'text', 'handleVisitorInput')}
+                                <div class="flex gap-3 pt-2"><button onclick="updateState({showVisitorModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100">انصراف</button><button onclick="saveVisitor()" class="flex-1 py-3 rounded-xl bg-purple-600 text-white shadow-lg">ذخیره</button></div>
+                            </div>
+                        </div>
+                    </div>` : ''}
+
+                ${state.showLeadModal ? `
+                    <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 page-enter">
+                        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden modal-enter max-h-[90vh] overflow-y-auto">
+                            <div class="p-4 border-b bg-gray-50 flex justify-between items-center"><h3 class="font-bold text-gray-800 flex gap-2">${state.leadForm.id ? 'ویرایش لید' : 'افزودن لید'}</h3><button onclick="updateState({showLeadModal: false})" class="text-gray-400"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+                            <div class="p-5">
+                                ${getCommonLeadFormHTML(null, 'leadForm', 'saveManagerLead', 'handleManagerLeadInput', '', '')}
+                                <div class="flex gap-3 pt-4"><button onclick="updateState({showLeadModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100">انصراف</button><button onclick="saveManagerLead()" class="flex-1 py-3 rounded-xl bg-blue-600 text-white shadow-lg">ذخیره</button></div>
+                            </div>
+                        </div>
+                    </div>` : ''}
+
+                ${state.showCategoryModal ? `
+                    <div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 page-enter">
+                        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-xs overflow-hidden modal-enter">
+                            <div class="p-4 border-b bg-gray-50 flex justify-between items-center"><h3 class="font-bold text-gray-800">دسته‌بندی</h3><button onclick="updateState({showCategoryModal: false})" class="text-gray-400"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+                            <div class="p-5 space-y-4">
+                                ${renderSimpleInput('categoryForm.name', 'نام دسته‌بندی', 'tag', 'text', 'handleCategoryInput')}
+                                <div class="flex gap-3 pt-2"><button onclick="updateState({showCategoryModal: false})" class="flex-1 py-3 rounded-xl bg-gray-100">انصراف</button><button onclick="saveCategory()" class="flex-1 py-3 rounded-xl bg-blue-600 text-white">ذخیره</button></div>
+                            </div>
+                        </div>
+                    </div>` : ''}
+            </div>`;
+        }
+
+        // --- GLOBAL HELPERS & EXPORTS ---
+
+        function renderSimpleInput(stateKey, label, icon, type = 'text', handler) {
+            const keys = stateKey.split('.');
+            const val = state[keys[0]][keys[1]] || '';
+            const onInput = `${handler}('${keys[1]}', this.value)`;
+            return `<div class="space-y-1"><label class="text-xs font-bold text-gray-500 block mr-1">${label}</label><div class="relative"><input type="${type}" value="${val}" oninput="${onInput}" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 pr-10 focus:border-blue-500 outline-none" dir="rtl" /><i data-lucide="${icon}" class="absolute right-3 top-3.5 text-gray-400 w-5 h-5"></i></div></div>`;
+        }
+
+        function renderInput(label, keyPath, icon, required = false, placeholder = '', type = 'text', handler = 'handleLeadInput') {
+            const keys = keyPath.split('.'); 
+            // Support nested state keys like 'leadForm.business_name'
+            const val = keys.length > 1 ? state[keys[0]][keys[1]] : state.form[keyPath];
+            // For nested, we only pass property name to handler if it supports it, otherwise raw path
+            const prop = keys.length > 1 ? keys[1] : keyPath;
+            
+            return `<div class="space-y-1"><label class="text-xs font-bold text-gray-500 block mr-1">${label} ${required ? '<span class="text-red-500">*</span>' : ''}</label><div class="relative"><input type="${type}" value="${val}" oninput="${handler}('${prop}', this.value)" placeholder="${placeholder}" class="w-full bg-white border border-gray-200 rounded-xl px-4 py-3 pr-10 focus:border-blue-500 outline-none" dir="rtl" /><i data-lucide="${icon}" class="absolute right-3 top-3.5 text-gray-400 w-5 h-5"></i></div></div>`;
+        }
+
+        window.handleVisitorInput = function(key, value) { state.visitorForm[key] = value; }
+        window.handleCategoryInput = function(key, value) { state.categoryForm[key] = value; }
+        window.handleLoginInput = function(key, value) { state.loginForm[key] = value; document.getElementById('login-btn').disabled = !(state.loginForm.username && state.loginForm.password); }
+        window.handleManagerLeadInput = function(key, value) { state.leadForm[key] = value; }
+        window.handleLeadInput = handleLeadInput;
+        
+        window.openVisitorModal = openVisitorModal;
+        window.saveVisitor = saveVisitor;
+        window.deleteVisitor = deleteVisitor;
+        
+        window.openLeadModal = openLeadModal;
+        window.saveManagerLead = saveManagerLead;
+        window.deleteLead = deleteLead;
+        
+        window.openCategoryModal = openCategoryModal;
+        window.saveCategory = saveCategory;
+        window.deleteCategory = deleteCategory;
+
+        function showToast(message, type) {
+            const toast = document.getElementById('toast');
+            document.getElementById('toast-message').innerText = message;
+            document.getElementById('toast-icon').innerHTML = type === 'success' ? '<i data-lucide="check-circle" class="text-green-400 w-5 h-5"></i>' : '<i data-lucide="info" class="text-red-400 w-5 h-5"></i>';
+            if(window.lucide) lucide.createIcons();
+            toast.classList.remove('opacity-0', '-translate-y-24');
+            toast.classList.add('opacity-100', 'translate-y-0');
+            setTimeout(() => { toast.classList.add('opacity-0', '-translate-y-24'); toast.classList.remove('opacity-100', 'translate-y-0'); }, 3000);
+        }
+
+        window.addEventListener('load', () => { initApp().then(() => render()); });
+
+    </script>
+</body>
+</html>
